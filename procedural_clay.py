@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Procedural Clay",
     "author": "Ignacio Soler",
-    "version": (2, 2, 0),
+    "version": (2, 3, 0),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar (N) > Clay",
     "description": "UV-free procedural plasticine: material + silhouette deformation, tuned for EEVEE",
@@ -45,7 +45,7 @@ from bpy.props import (BoolProperty, FloatProperty, FloatVectorProperty, IntProp
 from bpy.types import Operator, Panel, PropertyGroup
 
 SHADER_GROUP = "PC_ClayShader"
-SHADER_VERSION = 2
+SHADER_VERSION = 3
 DEFORM_GROUP = "PC_ClayDeform"
 DEFORM_VERSION = 2
 NODE_NAME = "Clay Controls"
@@ -56,8 +56,11 @@ MAT_TAG = "procedural_clay"
 SHADER_INPUTS = [
     ("Clay Color", "NodeSocketColor", (0.62, 0.36, 0.25, 1.0), None, None, False,
      "Base color of the clay"),
-    ("Roughness", "NodeSocketFloat", 0.7, 0.0, 1.0, True,
-     "Overall surface roughness"),
+    ("Roughness", "NodeSocketFloat", 0.5, 0.0, 1.0, True,
+     "Overall surface roughness. Play-Doh sits around 0.45-0.55"),
+    ("Subsurface", "NodeSocketFloat", 0.3, 0.0, 1.0, True,
+     "Light bleeding through the clay: softens shading and glows at thin parts. "
+     "Scaled to each object's size"),
     ("Grain Intensity", "NodeSocketFloat", 0.35, 0.0, 1.0, True,
      "Strength of the fine grain and pores"),
     ("Imperfection", "NodeSocketFloat", 0.45, 0.0, 1.0, True,
@@ -73,6 +76,8 @@ SHADER_INPUTS = [
      "Size of the small pits in the surface"),
     ("Color Variation", "NodeSocketFloat", 0.4, 0.0, 1.0, True,
      "How much the dents tint the base color"),
+    ("Specks", "NodeSocketFloat", 0.25, 0.0, 1.0, True,
+     "Tiny light flecks, like dust or bits of other clay pressed in"),
     ("Texture Scale", "NodeSocketFloat", 1.0, 0.001, 100.0, False,
      "Global scale of all patterns. Raise it for large objects"),
     ("Seed", "NodeSocketFloat", 0.0, 0.0, 10000.0, False,
@@ -310,13 +315,50 @@ def _build_shader_group():
     rough = b.math("MULTIPLY_ADD", 720, -500, a=gc, b=0.2, c=I["Roughness"])
     rough = b.math("MULTIPLY_ADD", 890, -500, a=pore_mask, b=0.1, c=rough, clamp=True)
 
+    # Specks: a sparse subset of small Voronoi cells gets a lighter dot
+    spv = b.node("ShaderNodeTexVoronoi", 700, 1600, label="Specks",
+                 voronoi_dimensions="3D", feature="F1", distance="EUCLIDEAN")
+    b.link(coords, spv.inputs["Vector"])
+    b.link(b.math("MULTIPLY", 500, 1600, a=I["Grain Scale"], b=0.3), spv.inputs["Scale"])
+    sp_sep = b.node("ShaderNodeSeparateColor", 880, 1500)
+    b.link(spv.outputs["Color"], sp_sep.inputs["Color"])
+    sp_on = b.math("GREATER_THAN", 1050, 1500, a=sp_sep.outputs[1], b=0.88)
+    sp_dot = b.node("ShaderNodeMapRange", 880, 1700, clamp=True, interpolation_type="SMOOTHSTEP")
+    b.link(spv.outputs["Distance"], sp_dot.inputs["Value"])
+    sp_dot.inputs["From Min"].default_value = 0.0
+    sp_dot.inputs["From Max"].default_value = 0.12
+    sp_dot.inputs["To Min"].default_value = 1.0
+    sp_dot.inputs["To Max"].default_value = 0.0
+    sp_mask = b.math("MULTIPLY", 1050, 1700, a=sp_dot.outputs["Result"], b=sp_on)
+    sp_mask = b.math("MULTIPLY", 1200, 1700, a=sp_mask, b=I["Specks"], label="Speck Mask")
+    lighter = b.node("ShaderNodeHueSaturation", 1050, 1350, label="Speck Color")
+    b.link(I["Clay Color"], lighter.inputs["Color"])
+    lighter.inputs["Saturation"].default_value = 0.6
+    lighter.inputs["Value"].default_value = 1.6
+    mix_sp = b.node("ShaderNodeMix", 1300, 1250, label="Specks", data_type="RGBA", blend_type="MIX")
+    b.link(sp_mask, mix_sp.inputs[0])
+    b.link(mix_cav.outputs[2], mix_sp.inputs[6])
+    b.link(lighter.outputs["Color"], mix_sp.inputs[7])
+
+    # Subsurface radius scales with the object: the apply operator stores
+    # each object's size in the "pclay_size" custom property, read here with
+    # an Object-type Attribute node (works in Cycles and EEVEE). A fixed
+    # radius would make small objects glow and big ones look like plastic.
+    size_attr = b.node("ShaderNodeAttribute", 900, 50, label="Object Size",
+                       attribute_type="OBJECT", attribute_name="pclay_size")
+    sss_scale = b.math("MULTIPLY", 1100, 50, a=size_attr.outputs["Fac"], b=0.02,
+                       label="SSS Scale")
+
     bsdf = b.node("ShaderNodeBsdfPrincipled", 1300, 300)
-    b.link(mix_cav.outputs[2], bsdf.inputs["Base Color"])
+    b.link(mix_sp.outputs[2], bsdf.inputs["Base Color"])
     b.link(rough, bsdf.inputs["Roughness"])
     b.link(bump3.outputs["Normal"], bsdf.inputs["Normal"])
-    _set_input(bsdf, "Specular IOR Level", 0.35)
-    _set_input(bsdf, "Sheen Weight", 0.08)
-    _set_input(bsdf, "Sheen Roughness", 0.6)
+    _set_input(bsdf, "Specular IOR Level", 0.5)
+    _set_input(bsdf, "Sheen Weight", 0.15)
+    _set_input(bsdf, "Sheen Roughness", 0.5)
+    b.link(I["Subsurface"], bsdf.inputs["Subsurface Weight"])
+    b.link(sss_scale, bsdf.inputs["Subsurface Scale"])
+    _set_input(bsdf, "Subsurface Radius", (1.0, 0.5, 0.3))
     b.link(bsdf.outputs["BSDF"], gout.inputs["BSDF"])
     return ng
 
@@ -429,6 +471,35 @@ def find_clay_node(mat):
     if node is None or node.type != "GROUP" or node.node_tree is None:
         return None
     return node
+
+
+def upgrade_clay_material(mat):
+    """Point an existing clay material at the current shader group, keeping
+    the values of every input that still exists."""
+    node = find_clay_node(mat)
+    group = _get_group(SHADER_GROUP, SHADER_VERSION, _build_shader_group)
+    if node is None or node.node_tree is group:
+        return
+    saved = {}
+    for sock in node.inputs:
+        if hasattr(sock, "default_value"):
+            v = sock.default_value
+            saved[sock.name] = tuple(v) if hasattr(v, "__len__") else v
+    node.node_tree = group
+    for sock in node.inputs:
+        if sock.name in saved:
+            try:
+                sock.default_value = saved[sock.name]
+            except (TypeError, ValueError):
+                pass
+    out = mat.node_tree.nodes.get("Material Output")
+    if out is not None and not out.inputs["Surface"].is_linked:
+        mat.node_tree.links.new(node.outputs["BSDF"], out.inputs["Surface"])
+
+
+def tag_object_size(obj):
+    """Store world-space size for the shader (subsurface radius)."""
+    obj["pclay_size"] = max(obj.dimensions.length, 0.001)
 
 
 def find_deform_mod(obj):
@@ -561,14 +632,24 @@ class PCLAY_OT_apply(Operator):
 
     def execute(self, context):
         targets = [o for o in context.selected_objects if supports_materials(o)]
-        shared_mat = create_clay_material(self.color, 0.0) if self.shared else None
+        shared_mat = None
         for obj in targets:
-            mat = shared_mat or create_clay_material(self.color, random.uniform(0.0, 1000.0))
-            if self.replace or not obj.material_slots:
-                obj.data.materials.clear()
-                obj.data.materials.append(mat)
+            tag_object_size(obj)
+            existing = obj.active_material
+            if find_clay_node(existing) is not None:
+                # Already clay: upgrade in place and keep the user's settings
+                upgrade_clay_material(existing)
             else:
-                obj.active_material = mat
+                if self.shared:
+                    shared_mat = shared_mat or create_clay_material(self.color, 0.0)
+                    mat = shared_mat
+                else:
+                    mat = create_clay_material(self.color, random.uniform(0.0, 1000.0))
+                if self.replace or not obj.material_slots:
+                    obj.data.materials.clear()
+                    obj.data.materials.append(mat)
+                else:
+                    obj.active_material = mat
             if self.deform and obj.type == "MESH":
                 add_deform_modifier(obj, self.intensity)
         self.report({"INFO"}, f"Clay applied to {len(targets)} object(s)")
@@ -644,6 +725,191 @@ class PCLAY_OT_eevee_setup(Operator):
         return {"FINISHED"}
 
 
+PRESETS = {
+    # values: Roughness, Subsurface, Grain Intensity, Imperfection, Cavity, Pores, Specks, Color Variation
+    "PLAYDOH": ("Play-Doh", "Soft, slightly glossy, light bleeding through",
+                (0.5, 0.3, 0.25, 0.4, 0.35, 0.2, 0.25, 0.3)),
+    "SMOOTH": ("Smooth Clay", "Very soft and clean, almost no grain",
+               (0.45, 0.4, 0.12, 0.3, 0.25, 0.08, 0.1, 0.2)),
+    "PLASTICINE": ("Plasticine", "Oil-based modelling clay: matte, handled, more dents",
+                   (0.6, 0.15, 0.4, 0.6, 0.5, 0.35, 0.1, 0.4)),
+    "TERRACOTTA": ("Dry Clay", "Air-dry / terracotta: very matte, porous, no translucency",
+                   (0.85, 0.0, 0.6, 0.5, 0.6, 0.5, 0.4, 0.5)),
+}
+PRESET_KEYS = ("Roughness", "Subsurface", "Grain Intensity", "Imperfection", "Cavity",
+               "Pores", "Specks", "Color Variation")
+
+
+class PCLAY_OT_preset(Operator):
+    bl_idname = "pclay.preset"
+    bl_label = "Clay Preset"
+    bl_description = "Set the surface sliders of the active clay material (color is kept)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    preset: bpy.props.EnumProperty(
+        name="Preset",
+        items=[(k, v[0], v[1]) for k, v in PRESETS.items()])
+
+    @classmethod
+    def poll(cls, context):
+        return _active_clay(context)[1] is not None
+
+    def execute(self, context):
+        mat, node = _active_clay(context)
+        upgrade_clay_material(mat)
+        node = find_clay_node(mat)
+        for key, val in zip(PRESET_KEYS, PRESETS[self.preset][2]):
+            if key in node.inputs:
+                node.inputs[key].default_value = val
+        mat.roughness = node.inputs["Roughness"].default_value
+        return {"FINISHED"}
+
+
+def _world_bounds(objs):
+    from mathutils import Vector
+    pts = [o.matrix_world @ Vector(c) for o in objs for c in o.bound_box]
+    lo = Vector((min(p.x for p in pts), min(p.y for p in pts), min(p.z for p in pts)))
+    hi = Vector((max(p.x for p in pts), max(p.y for p in pts), max(p.z for p in pts)))
+    return lo, hi
+
+
+def _backdrop_mesh(name, width, depth, height, radius, floor_z, center_x, center_y):
+    """Seamless 'cyclorama': floor that curves up into a back wall."""
+    import math
+    profile = []  # (y, z) from front edge to top of wall
+    profile.append((-depth, 0.0))
+    profile.append((depth * 0.5 - radius, 0.0))
+    for i in range(1, 12):
+        a = (math.pi / 2) * i / 12
+        profile.append((depth * 0.5 - radius + math.sin(a) * radius, radius - math.cos(a) * radius))
+    profile.append((depth * 0.5, radius))
+    profile.append((depth * 0.5, height))
+    xs = (-width / 2, width / 2)
+    verts, faces = [], []
+    for y, z in profile:
+        for x in xs:
+            verts.append((center_x + x, center_y + y, floor_z + z))
+    for i in range(len(profile) - 1):
+        a = i * 2
+        faces.append((a, a + 1, a + 3, a + 2))
+    me = bpy.data.meshes.new(name)
+    me.from_pydata(verts, [], faces)
+    me.update()
+    for poly in me.polygons:
+        poly.use_smooth = True
+    return me
+
+
+class PCLAY_OT_studio_setup(Operator):
+    bl_idname = "pclay.studio_setup"
+    bl_label = "Studio Setup"
+    bl_description = ("Build a product-shot scene around the selection: seamless backdrop, "
+                      "soft key/fill/rim area lights, camera with depth of field, EEVEE settings. "
+                      "Running it again rebuilds it")
+    bl_options = {"REGISTER", "UNDO"}
+
+    backdrop_color: FloatVectorProperty(
+        name="Backdrop", subtype="COLOR", size=4, min=0.0, max=1.0,
+        default=(0.0, 0.0, 0.0, 1.0),
+        description="Black = derive a soft tint from the active clay color")
+    light_power: FloatProperty(name="Light Power", default=1.0, min=0.05, max=10.0)
+    dof: BoolProperty(name="Depth of Field", default=True)
+
+    @classmethod
+    def poll(cls, context):
+        return any(o.type == "MESH" for o in context.selected_objects)
+
+    def execute(self, context):
+        import colorsys
+        import math
+        from mathutils import Vector
+
+        scene = context.scene
+        subjects = [o for o in context.selected_objects if o.type == "MESH"]
+        lo, hi = _world_bounds(subjects)
+        center = (lo + hi) / 2
+        size = max((hi - lo).length, 0.01)
+
+        # fresh collection each run (idempotent)
+        coll = bpy.data.collections.get("Clay Studio")
+        if coll is not None:
+            for o in list(coll.objects):
+                bpy.data.objects.remove(o, do_unlink=True)
+        else:
+            coll = bpy.data.collections.new("Clay Studio")
+            scene.collection.children.link(coll)
+
+        # backdrop color: pale, desaturated version of the clay
+        bg = tuple(self.backdrop_color)
+        if sum(bg[:3]) == 0.0:
+            _, node = _active_clay(context)
+            base = tuple(node.inputs["Clay Color"].default_value)[:3] if node else (0.7, 0.5, 0.5)
+            h, s, v = colorsys.rgb_to_hsv(*base)
+            bg = (*colorsys.hsv_to_rgb(h, min(1.0, s * 0.6), min(1.0, 0.2 + v * 0.45)), 1.0)
+        bmat = bpy.data.materials.get("Clay Studio Backdrop") or bpy.data.materials.new("Clay Studio Backdrop")
+        if bpy.app.version < (5, 0, 0):
+            bmat.use_nodes = True
+        pb = bmat.node_tree.nodes.get("Principled BSDF")
+        if pb:
+            pb.inputs["Base Color"].default_value = bg
+            pb.inputs["Roughness"].default_value = 0.85
+        bmat.diffuse_color = bg
+
+        me = _backdrop_mesh("Clay Backdrop", size * 8, size * 8, size * 4, size * 1.2,
+                            lo.z, center.x, center.y)
+        me.materials.append(bmat)
+        back = bpy.data.objects.new("Clay Backdrop", me)
+        coll.objects.link(back)
+
+        def add_light(name, offset, power, radius):
+            ld = bpy.data.lights.new(name, "AREA")
+            ld.shape = "DISK"
+            ld.size = radius
+            dist = offset.length
+            ld.energy = power * dist * dist * self.light_power
+            if hasattr(ld, "use_shadow_jitter"):
+                ld.use_shadow_jitter = True  # soft shadows in the EEVEE viewport too
+            ob = bpy.data.objects.new(name, ld)
+            ob.location = center + offset
+            ob.rotation_euler = (center - ob.location).to_track_quat("-Z", "Y").to_euler()
+            coll.objects.link(ob)
+            return ob
+
+        s = size
+        add_light("Clay Key", Vector((-1.4 * s, -1.6 * s, 1.8 * s)), 50.0, 2.5 * s)
+        add_light("Clay Fill", Vector((1.8 * s, -1.2 * s, 0.8 * s)), 12.0, 3.5 * s)
+        add_light("Clay Rim", Vector((0.6 * s, 1.6 * s, 1.6 * s)), 35.0, 1.5 * s)
+
+        cam = scene.camera
+        if cam is None:
+            cd = bpy.data.cameras.new("Clay Camera")
+            cam = bpy.data.objects.new("Clay Camera", cd)
+            coll.objects.link(cam)
+            scene.camera = cam
+            cd.lens = 85
+            direction = Vector((0.35, -1.0, 0.28)).normalized()
+            fov = 2 * math.atan(cd.sensor_width / (2 * cd.lens))
+            cam.location = center + direction * (0.62 * s / math.tan(fov / 2))
+            cam.rotation_euler = (center - cam.location).to_track_quat("-Z", "Y").to_euler()
+        cd = cam.data
+        cd.dof.use_dof = self.dof
+        cd.dof.focus_distance = (cam.location - center).length
+        cd.dof.aperture_fstop = 2.8
+
+        world = scene.world or bpy.data.worlds.new("World")
+        scene.world = world
+        world.color = tuple(c * 0.25 for c in bg[:3])
+
+        try:
+            scene.view_settings.view_transform = "AgX"
+            scene.view_settings.look = "AgX - Medium High Contrast"
+        except TypeError:
+            pass
+        bpy.ops.pclay.eevee_setup()
+        self.report({"INFO"}, "Clay studio ready (camera view: Numpad 0)")
+        return {"FINISHED"}
+
+
 class PCLAY_OT_sync_viewport_color(Operator):
     bl_idname = "pclay.sync_viewport_color"
     bl_label = "Sync Solid View Color"
@@ -680,7 +946,9 @@ class VIEW3D_PT_procedural_clay(Panel):
         row = layout.row(align=True)
         row.scale_y = 1.3
         row.operator(PCLAY_OT_apply.bl_idname, icon="MATERIAL")
-        layout.operator(PCLAY_OT_eevee_setup.bl_idname, icon="SHADING_RENDERED")
+        row = layout.row(align=True)
+        row.operator(PCLAY_OT_studio_setup.bl_idname, icon="LIGHT_AREA")
+        row.operator(PCLAY_OT_eevee_setup.bl_idname, text="EEVEE Only", icon="SHADING_RENDERED")
 
         obj = context.active_object
         mat, node = _active_clay(context)
@@ -705,9 +973,11 @@ class VIEW3D_PT_procedural_clay(Panel):
             users = mat.users - (1 if mat.use_fake_user else 0)
             if users > 1:
                 row.label(text=f"{users} users")
+            box.operator_menu_enum(PCLAY_OT_preset.bl_idname, "preset", text="Preset", icon="PRESET")
             col = _split_col(box)
-            for name in ("Clay Color", "Roughness", "Grain Intensity", "Imperfection"):
-                col.prop(node.inputs[name], "default_value", text=name)
+            for name in ("Clay Color", "Roughness", "Subsurface", "Grain Intensity", "Imperfection"):
+                if name in node.inputs:  # older materials may lack newer inputs
+                    col.prop(node.inputs[name], "default_value", text=name)
 
         space = context.space_data
         if space and space.type == "VIEW_3D" and space.shading.type in {"SOLID", "WIREFRAME"}:
@@ -742,9 +1012,10 @@ class VIEW3D_PT_procedural_clay_detail(Panel):
         if node is not None:
             layout.label(text="Surface", icon="MATERIAL")
             col = _split_col(layout)
-            for name in ("Cavity", "Imperfection Scale", "Grain Scale", "Pores",
+            for name in ("Cavity", "Specks", "Imperfection Scale", "Grain Scale", "Pores",
                          "Color Variation", "Texture Scale"):
-                col.prop(node.inputs[name], "default_value", text=name)
+                if name in node.inputs:  # older materials may lack newer inputs
+                    col.prop(node.inputs[name], "default_value", text=name)
             col.prop(node.inputs["Seed"], "default_value", text="Seed")
             layout.operator(PCLAY_OT_sync_viewport_color.bl_idname, icon="SHADING_SOLID")
 
@@ -762,6 +1033,8 @@ classes = (
     PCLAY_OT_add_deform,
     PCLAY_OT_randomize_seed,
     PCLAY_OT_eevee_setup,
+    PCLAY_OT_preset,
+    PCLAY_OT_studio_setup,
     PCLAY_OT_sync_viewport_color,
     VIEW3D_PT_procedural_clay,
     VIEW3D_PT_procedural_clay_detail,

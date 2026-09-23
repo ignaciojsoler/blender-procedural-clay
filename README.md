@@ -2,6 +2,8 @@
 
 Blender add-on that turns any object into handmade plasticine: a procedural clay material plus an optional shape deformation. No UV unwrapping needed. Tuned for EEVEE, also works in Cycles.
 
+![Studio Setup render](docs/studio.png)
+
 ![Deformation at 0, 0.5 and 1](docs/deformation.png)
 
 ## Features
@@ -10,7 +12,9 @@ Blender add-on that turns any object into handmade plasticine: a procedural clay
 - **Cavity**: dents, pores and grain also darken the albedo, so the detail stays visible under EEVEE's flat lighting.
 - **Clay Deform modifier** (Geometry Nodes): makes the silhouette lumpy, not just the shading. Lumps are relative to the object's size and biased inward, so the overall shape is preserved.
 - **Sidebar panel** (`N` > Clay): Clay Color, Roughness, Grain Intensity, Imperfection, Deformation, plus a Detail subpanel with scales, pores, seed, etc.
-- **EEVEE Clay Setup**: one click for ray tracing, horizon-scan AO and soft shadows.
+- **Presets**: Play-Doh, Smooth Clay, Plasticine, Dry Clay.
+- **Studio Setup**: seamless backdrop, soft 3-light rig, DOF camera and EEVEE settings in one click.
+- **EEVEE Only**: just the render settings (ray tracing, horizon-scan AO, soft shadows).
 
 ## Requirements
 
@@ -27,7 +31,8 @@ Blender 4.2+ (tested on 5.0 and 5.2).
 1. Select one or more objects.
 2. Sidebar (`N`) > **Clay** > **Apply Clay**.
 3. Switch the viewport to Material Preview or Rendered.
-4. Optional: **EEVEE Clay Setup**.
+4. Pick a **Preset**, then fine-tune.
+5. Optional: select the model and press **Studio Setup**, then look through the camera (Numpad 0).
 
 Tips:
 - Apply the object's scale (`Ctrl+A` > Scale): Object coordinates ignore it, so an unapplied non-uniform scale stretches the pattern.
