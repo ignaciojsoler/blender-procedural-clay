@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.6.0
+- **Sticky textures**: Apply Clay turns on the object's Rest Position; Clay Deform samples its noise and measures size/density on the rest pose and stores it as `pc_coords` (+ `pc_has` flag) for the shader. Texture, fingerprints and lumps stay glued to the surface under armatures and shape keys, and nothing pops between frames. Objects without the modifier fall back to Object coordinates.
+- **Stop Motion** panel (scene-wide): Hold Frames (on 2s by default) and Boil. Lumps and surface detail jump to a new random state every held pose, like clay touched between shots. The shader is driven by simple-expression drivers (no Python auto-run needed).
+- **Animate on Steps / Smooth**: adds or removes Stepped F-curve modifiers on the selected objects' animation (keys untouched). Works with Blender 5 layered actions.
+
 ## 2.5.0
 - **Fingerprints rebuilt as a texture**: a tileable 2048 map of overlapping finger smudges with real-looking loops/whorls, generated once with numpy (~10 s), cached on disk and packed into the .blend. Box-projected in object space (no UVs). Textures are mipmapped, so ridges never shimmer in EEVEE and cost one lookup. Shows mostly in the highlights (touched clay is slightly polished).
 - **Custom Prints**: load your own seamless fingerprint texture (Detail panel), or go back to the built-in one.

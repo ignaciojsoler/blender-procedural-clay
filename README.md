@@ -12,6 +12,8 @@ Blender add-on that turns any object into handmade plasticine: a procedural clay
 - **Fingerprints**: generated, tileable smudge map with real ridge patterns, box-projected (no UVs), mipmapped so it doesn't flicker. You can load your own.
 - **Cavity**: dents, pores and grain also darken the albedo, so the detail stays visible under EEVEE's flat lighting.
 - **Clay Deform modifier** (Geometry Nodes): makes the silhouette lumpy, not just the shading. Lumps are relative to the object's size and biased inward, so the overall shape is preserved.
+- **Sticky**: textures and lumps stay glued to the surface when an armature or shape keys deform the mesh.
+- **Stop Motion**: poses held on 2s/3s, surface "boil" between poses, one-click stepped animation.
 - **Sidebar panel** (`N` > Clay): Clay Color, Roughness, Grain Intensity, Imperfection, Deformation, plus a Detail subpanel with scales, pores, seed, etc.
 - **Presets**: Play-Doh, Smooth Clay, Plasticine, Dry Clay.
 - **Studio Setup**: seamless backdrop, soft 3-light rig, DOF camera and EEVEE settings in one click.

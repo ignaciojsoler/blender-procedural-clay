@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Procedural Clay",
     "author": "Ignacio Soler",
-    "version": (2, 5, 0),
+    "version": (2, 6, 0),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar (N) > Clay",
     "description": "UV-free procedural plasticine: material + silhouette deformation, tuned for EEVEE",
@@ -46,9 +46,9 @@ from bpy.props import (BoolProperty, FloatProperty, FloatVectorProperty, IntProp
 from bpy.types import Operator, Panel, PropertyGroup
 
 SHADER_GROUP = "PC_ClayShader"
-SHADER_VERSION = 5
+SHADER_VERSION = 6
 DEFORM_GROUP = "PC_ClayDeform"
-DEFORM_VERSION = 3
+DEFORM_VERSION = 4
 NODE_NAME = "Clay Controls"
 MOD_NAME = "Clay Deform"
 MAT_TAG = "procedural_clay"
@@ -92,6 +92,11 @@ SHADER_INPUTS = [
      "Global scale of all patterns. Raise it for large objects"),
     ("Seed", "NodeSocketFloat", 0.0, 0.0, 10000.0, False,
      "Changes the pattern so copies don't look identical"),
+    # Driven by the Stop Motion settings (drivers added by the add-on)
+    ("Boil Frame", "NodeSocketFloat", 0.0, 0.0, 1000000.0, False,
+     "Stop-motion step index. Driven automatically"),
+    ("Boil Amount", "NodeSocketFloat", 0.0, 0.0, 1.0, True,
+     "Stop-motion surface jitter. Driven automatically"),
 ]
 
 DEFORM_INPUTS = [
@@ -106,6 +111,10 @@ DEFORM_INPUTS = [
      "(none on dense meshes). Each level x4 faces"),
     ("Seed", "NodeSocketFloat", 0.0, 0.0, 10000.0, False,
      "Changes the deformation pattern"),
+    ("Boil", "NodeSocketFloat", 0.0, 0.0, 1.0, True,
+     "Stop-motion jitter of the lumps. Set from the Stop Motion panel"),
+    ("Boil Step", "NodeSocketInt", 2, 1, 12, False,
+     "Frames each stop-motion pose is held"),
 ]
 
 
@@ -326,8 +335,33 @@ def _build_shader_group():
     I = gin.outputs
 
     # Coordinates: object space, scaled, offset by seed
-    tc = b.node("ShaderNodeTexCoord", -1600, 350)
-    scaled = b.vmath("SCALE", -1400, 350, a=tc.outputs["Object"], scale=I["Texture Scale"])
+    # Sticky coordinates. Object coordinates are taken from the *deformed*
+    # mesh, so with an armature or shape keys the texture slides over the
+    # surface. The Clay Deform modifier stores the rest pose ("pc_coords")
+    # plus a flag ("pc_has"); without the modifier the flag reads 0 and we
+    # fall back to plain Object coordinates.
+    tc = b.node("ShaderNodeTexCoord", -2200, 350)
+    pcc = b.node("ShaderNodeAttribute", -2200, 150, label="Rest Coords",
+                 attribute_type="GEOMETRY", attribute_name="pc_coords")
+    pch = b.node("ShaderNodeAttribute", -2200, -50, label="Has Rest Coords",
+                 attribute_type="GEOMETRY", attribute_name="pc_has")
+    mixc = b.node("ShaderNodeMix", -2000, 300, label="Sticky Coords", data_type="VECTOR")
+    b.link(pch.outputs["Fac"], mixc.inputs[0])
+    b.link(tc.outputs["Object"], mixc.inputs[4])
+    b.link(pcc.outputs["Vector"], mixc.inputs[5])
+
+    # Stop-motion boil: every held pose shifts all surface detail by a small
+    # random amount (like the clay being handled between shots).
+    bsize = b.node("ShaderNodeAttribute", -2200, -250, label="Object Size",
+                   attribute_type="OBJECT", attribute_name="pclay_size")
+    bwn = b.node("ShaderNodeTexWhiteNoise", -2000, 0, label="Boil Hash", noise_dimensions="1D")
+    b.link(I["Boil Frame"], bwn.inputs["W"])
+    bcent = b.vmath("SUBTRACT", -1820, 0, a=bwn.outputs["Color"], b=(0.5, 0.5, 0.5))
+    bamt = b.math("MULTIPLY", -1820, -200, a=I["Boil Amount"], b=bsize.outputs["Fac"])
+    bamt = b.math("MULTIPLY", -1640, -200, a=bamt, b=0.03)
+    boff = b.vmath("SCALE", -1640, 0, a=bcent, scale=bamt, label="Boil Offset")
+    base = b.vmath("ADD", -1600, 300, a=mixc.outputs[1], b=boff)
+    scaled = b.vmath("SCALE", -1400, 350, a=base, scale=I["Texture Scale"])
     coords = b.vmath("ADD", -1000, 350, a=scaled, b=b.seed_offset(I["Seed"], -1400, 150),
                      label="Seeded Coords")
 
@@ -539,10 +573,26 @@ def _build_deform_group():
     gout = b.node("NodeGroupOutput", 900, 0)
     I = gin.outputs
 
-    # Size of the object (bounding-box diagonal), measured before subdividing
-    bbox = b.node("GeometryNodeBoundBox", -1200, -300)
-    b.link(I["Geometry"], bbox.inputs["Geometry"])
-    diag = b.vmath("SUBTRACT", -1000, -300, a=bbox.outputs["Max"], b=bbox.outputs["Min"])
+    # Rest-pose coordinates. With the object's "rest_position" attribute
+    # (enabled by the add-on) every measurement and noise lookup uses the
+    # un-posed mesh, so lumps stick to the surface when an armature or shape
+    # keys move it, and sizes/levels don't change from frame to frame.
+    rest = b.node("GeometryNodeInputNamedAttribute", -2000, -900, label="Rest Position",
+                  data_type="FLOAT_VECTOR")
+    rest.inputs["Name"].default_value = "rest_position"
+    posn = b.node("GeometryNodeInputPosition", -2000, -1050)
+    sw = b.node("GeometryNodeSwitch", -1800, -950, input_type="VECTOR")
+    b.link(rest.outputs["Exists"], sw.inputs["Switch"])
+    b.link(posn.outputs["Position"], sw.inputs["False"])
+    b.link(rest.outputs["Attribute"], sw.inputs["True"])
+    rest_co = sw.outputs["Output"]
+
+    # Size of the object (rest-pose bounding-box diagonal), before subdividing
+    bstat = b.node("GeometryNodeAttributeStatistic", -1200, -300, data_type="FLOAT_VECTOR",
+                   domain="POINT")
+    b.link(I["Geometry"], bstat.inputs["Geometry"])
+    b.link(rest_co, bstat.inputs["Attribute"])
+    diag = b.vmath("SUBTRACT", -1000, -300, a=bstat.outputs["Max"], b=bstat.outputs["Min"])
     size = b.vmath("LENGTH", -820, -300, a=diag)
     size = b.math("MAXIMUM", -650, -300, a=size, b=0.0001, label="Object Size")
 
@@ -552,7 +602,14 @@ def _build_deform_group():
     # edge length and add only the levels needed to get ~8 vertices per lump;
     # "Subdivisions" is the upper limit.
     ev = b.node("GeometryNodeInputMeshEdgeVertices", -1600, 450)
-    elen = b.vmath("DISTANCE", -1420, 450, a=ev.outputs["Position 1"], b=ev.outputs["Position 2"])
+    def _sample(idx_sock, y):
+        n = b.node("GeometryNodeSampleIndex", -1420, y, data_type="FLOAT_VECTOR", domain="POINT")
+        b.link(I["Geometry"], n.inputs["Geometry"])
+        b.link(rest_co, n.inputs["Value"])
+        b.link(idx_sock, n.inputs["Index"])
+        return n.outputs["Value"]
+    elen = b.vmath("DISTANCE", -1240, 600, a=_sample(ev.outputs["Vertex Index 1"], 650),
+                   b=_sample(ev.outputs["Vertex Index 2"], 550))
     stat = b.node("GeometryNodeAttributeStatistic", -1240, 450, data_type="FLOAT", domain="EDGE")
     b.link(I["Geometry"], stat.inputs["Geometry"])
     b.link(elen, stat.inputs["Attribute"])
@@ -582,11 +639,24 @@ def _build_deform_group():
     hops = b.math("MAXIMUM", 740, 350, a=hops, b=2.0, label="Blur Iterations")
 
     # Noise sampled in object space normalised by size -> size-independent look
-    pos = b.node("GeometryNodeInputPosition", -1000, -600)
     inv = b.math("DIVIDE", -650, -500, a=1.0, b=size)
     freq = b.math("DIVIDE", -480, -500, a=inv, b=I["Lump Size"])
-    p = b.vmath("SCALE", -300, -600, a=pos.outputs["Position"], scale=freq)
+    p = b.vmath("SCALE", -300, -600, a=rest_co, scale=freq)
     p = b.vmath("ADD", -120, -600, a=p, b=b.seed_offset(I["Seed"], -480, -750))
+
+    # Stop-motion boil: hold each pose for "Boil Step" frames, then jump the
+    # noise lookup by a random offset (in lump units), so lumps re-shape in
+    # steps like hand-touched clay between shots.
+    stime = b.node("GeometryNodeInputSceneTime", -700, -1100)
+    stepn = b.math("MAXIMUM", -520, -1150, a=I["Boil Step"], b=1.0)
+    sidx = b.math("DIVIDE", -340, -1100, a=stime.outputs["Frame"], b=stepn)
+    sidx = b.math("FLOOR", -160, -1100, a=sidx, label="Pose Index")
+    gwn = b.node("ShaderNodeTexWhiteNoise", 20, -1100, label="Boil Hash", noise_dimensions="1D")
+    b.link(sidx, gwn.inputs["W"])
+    gcent = b.vmath("SUBTRACT", 200, -1100, a=gwn.outputs["Color"], b=(0.5, 0.5, 0.5))
+    gj = b.math("MULTIPLY", 200, -1250, a=I["Boil"], b=0.6)
+    gjit = b.vmath("SCALE", 380, -1100, a=gcent, scale=gj, label="Boil Jitter")
+    p = b.vmath("ADD", 60, -700, a=p, b=gjit)
 
     # Lumps are sized relative to the object (Lump Size = fraction of its
     # diagonal). They must stay well below the object's size: noise at a
@@ -626,8 +696,20 @@ def _build_deform_group():
     smooth_n = b.vmath("NORMALIZE", 740, -50, a=blur.outputs["Value"])
     off = b.vmath("SCALE", 900, -150, a=smooth_n, scale=disp)
 
+    # Hand the rest-pose coordinates to the shader (sticky textures)
+    st1 = b.node("GeometryNodeStoreNamedAttribute", 300, 250, data_type="FLOAT_VECTOR",
+                 domain="POINT", label="Store Rest Coords")
+    st1.inputs["Name"].default_value = "pc_coords"
+    b.link(subdiv.outputs["Mesh"], st1.inputs["Geometry"])
+    b.link(rest_co, st1.inputs["Value"])
+    st2 = b.node("GeometryNodeStoreNamedAttribute", 500, 250, data_type="FLOAT",
+                 domain="POINT", label="Store Flag")
+    st2.inputs["Name"].default_value = "pc_has"
+    st2.inputs["Value"].default_value = 1.0
+    b.link(st1.outputs["Geometry"], st2.inputs["Geometry"])
+
     setpos = b.node("GeometryNodeSetPosition", 700, 100)
-    b.link(subdiv.outputs["Mesh"], setpos.inputs["Geometry"])
+    b.link(st2.outputs["Geometry"], setpos.inputs["Geometry"])
     b.link(off, setpos.inputs["Offset"])
     b.link(setpos.outputs["Geometry"], gout.inputs["Geometry"])
     return ng
@@ -657,6 +739,7 @@ def create_clay_material(color, seed):
     out.location = (320, 0)
     nt.links.new(grp.outputs["BSDF"], out.inputs["Surface"])
 
+    ensure_boil_drivers(mat, bpy.context.scene)
     mat.diffuse_color = color
     mat.roughness = grp.inputs["Roughness"].default_value
     return mat
@@ -691,6 +774,7 @@ def upgrade_clay_material(mat):
                 sock.default_value = saved[sock.name]
             except (TypeError, ValueError):
                 pass
+    ensure_boil_drivers(mat, bpy.context.scene)
     out = mat.node_tree.nodes.get("Material Output")
     if out is not None and not out.inputs["Surface"].is_linked:
         mat.node_tree.links.new(node.outputs["BSDF"], out.inputs["Surface"])
@@ -752,11 +836,139 @@ def push_deform_settings(obj):
     set_mod_input(mod, "Detail", s.detail)
     set_mod_input(mod, "Subdivisions", s.subdivisions)
     set_mod_input(mod, "Seed", s.seed)
+    sm = getattr(bpy.context.scene, "pclay_stop", None) if bpy.context else None
+    if sm is not None:
+        set_mod_input(mod, "Boil", sm.boil if sm.enabled else 0.0)
+        set_mod_input(mod, "Boil Step", sm.step)
     obj.update_tag()
 
 
 def _on_deform_change(self, context):
     push_deform_settings(self.id_data)
+
+
+# --------------------------------------------------------------------------
+# Stop motion
+# --------------------------------------------------------------------------
+
+def _all_clay_deform_objects():
+    return [o for o in bpy.data.objects if find_deform_mod(o) is not None]
+
+
+def _on_stop_change(self, context):
+    for obj in _all_clay_deform_objects():
+        push_deform_settings(obj)
+    # material drivers read these props directly; just make sure they re-evaluate
+    for mat in bpy.data.materials:
+        if find_clay_node(mat) is not None:
+            mat.node_tree.update_tag()
+
+
+class PCLAY_StopMotion(PropertyGroup):
+    """Scene-wide: stop motion is a look for the whole shot."""
+    enabled: BoolProperty(name="Stop Motion", default=False, update=_on_stop_change,
+                          description="Clay surface and lumps change in steps, like "
+                                      "hand-animated plasticine")
+    step: IntProperty(name="Hold Frames", default=2, min=1, max=12, update=_on_stop_change,
+                      description="Frames each pose is held (2 = 'on twos', the classic "
+                                  "claymation rhythm at 24 fps)")
+    boil: FloatProperty(name="Boil", default=0.5, min=0.0, max=1.0, subtype="FACTOR",
+                        update=_on_stop_change,
+                        description="How much the surface changes between held poses")
+
+
+def ensure_boil_drivers(mat, scene):
+    """Drive the shader's Boil Frame/Amount from the scene's stop-motion props.
+    Simple expressions only (floor/max/frame), so they run without Python
+    auto-execution being enabled."""
+    node = find_clay_node(mat)
+    if node is None or "Boil Frame" not in node.inputs:
+        return
+    nt = mat.node_tree
+    specs = (("Boil Frame", "floor(frame / max(step, 1)) * on"),
+             ("Boil Amount", "boil * on"))
+    for name, expr in specs:
+        idx = list(node.inputs).index(node.inputs[name])
+        path = f'nodes["{node.name}"].inputs[{idx}].default_value'
+        try:
+            nt.driver_remove(path)
+        except TypeError:
+            pass
+        fc = nt.driver_add(path)
+        drv = fc.driver
+        drv.type = "SCRIPTED"
+        for var_name, prop in (("step", "pclay_stop.step"), ("on", "pclay_stop.enabled"),
+                               ("boil", "pclay_stop.boil")):
+            v = drv.variables.new()
+            v.name = var_name
+            v.type = "SINGLE_PROP"
+            v.targets[0].id_type = "SCENE"
+            v.targets[0].id = scene
+            v.targets[0].data_path = prop
+        drv.expression = expr
+
+
+def _iter_fcurves(action, anim_data=None):
+    """F-curves of an action across Blender versions: 5.x layered actions
+    (channelbags per slot) and older flat actions."""
+    fcs = getattr(action, "fcurves", None)
+    if fcs is not None and len(fcs):
+        yield from fcs
+        return
+    for layer in getattr(action, "layers", []):
+        for strip in layer.strips:
+            for bag in getattr(strip, "channelbags", []):
+                yield from bag.fcurves
+
+
+def _animated_actions(objs):
+    seen = set()
+    for o in objs:
+        for idb in (o, getattr(o, "data", None)):
+            ad = getattr(idb, "animation_data", None) if idb is not None else None
+            if ad and ad.action and ad.action.name not in seen:
+                seen.add(ad.action.name)
+                yield ad.action
+
+
+class PCLAY_OT_step_animation(Operator):
+    bl_idname = "pclay.step_animation"
+    bl_label = "Animate on Steps"
+    bl_description = ("Hold each pose for 'Hold Frames' on the selected objects' animation "
+                      "(adds a Stepped modifier to their F-curves; the keys are untouched)")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        step = context.scene.pclay_stop.step
+        n = 0
+        for action in _animated_actions(context.selected_objects):
+            for fc in _iter_fcurves(action):
+                mod = next((m for m in fc.modifiers if m.type == "STEPPED"), None)
+                if mod is None:
+                    mod = fc.modifiers.new("STEPPED")
+                mod.frame_step = step
+                mod.frame_offset = 0
+                n += 1
+        if n == 0:
+            self.report({"WARNING"}, "Selected objects have no animation (for armatures, "
+                                     "select the armature)")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Stepped {n} animation curves on {step}s")
+        return {"FINISHED"}
+
+
+class PCLAY_OT_smooth_animation(Operator):
+    bl_idname = "pclay.smooth_animation"
+    bl_label = "Smooth Animation"
+    bl_description = "Remove the Stepped modifiers added by Animate on Steps"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        for action in _animated_actions(context.selected_objects):
+            for fc in _iter_fcurves(action):
+                for m in [m for m in fc.modifiers if m.type == "STEPPED"]:
+                    fc.modifiers.remove(m)
+        return {"FINISHED"}
 
 
 class PCLAY_DeformSettings(PropertyGroup):
@@ -779,12 +991,21 @@ class PCLAY_DeformSettings(PropertyGroup):
                         update=_on_deform_change)
 
 
+def enable_rest_position(obj):
+    """Ask Blender to keep the un-posed vertex positions (before armature and
+    shape keys) as the 'rest_position' attribute - the source of sticky
+    coordinates."""
+    if hasattr(obj, "add_rest_position_attribute"):
+        obj.add_rest_position_attribute = True
+
+
 def add_deform_modifier(obj, intensity):
     mod = find_deform_mod(obj)
     if mod is None:
         mod = obj.modifiers.new(MOD_NAME, "NODES")
     # always (re)point to the current group so re-applying upgrades old objects
     mod.node_group = _get_group(DEFORM_GROUP, DEFORM_VERSION, _build_deform_group)
+    enable_rest_position(obj)
     s = obj.pclay_deform
     s["intensity"] = intensity           # raw writes: skip 5 separate updates
     s["seed"] = random.uniform(0.0, 1000.0)
@@ -1233,6 +1454,28 @@ class VIEW3D_PT_procedural_clay(Panel):
             layout.label(text="Material Preview shows the surface", icon="SHADING_TEXTURE")
 
 
+class VIEW3D_PT_procedural_clay_stop(Panel):
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Clay"
+    bl_label = "Stop Motion"
+    bl_parent_id = "VIEW3D_PT_procedural_clay"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw_header(self, context):
+        self.layout.prop(context.scene.pclay_stop, "enabled", text="")
+
+    def draw(self, context):
+        sm = context.scene.pclay_stop
+        col = _split_col(self.layout)
+        col.active = sm.enabled
+        col.prop(sm, "step")
+        col.prop(sm, "boil")
+        row = self.layout.row(align=True)
+        row.operator(PCLAY_OT_step_animation.bl_idname, icon="IPO_CONSTANT")
+        row.operator(PCLAY_OT_smooth_animation.bl_idname, text="", icon="IPO_BEZIER")
+
+
 class VIEW3D_PT_procedural_clay_detail(Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -1282,6 +1525,9 @@ class VIEW3D_PT_procedural_clay_detail(Panel):
 # --------------------------------------------------------------------------
 
 classes = (
+    PCLAY_StopMotion,
+    PCLAY_OT_step_animation,
+    PCLAY_OT_smooth_animation,
     PCLAY_DeformSettings,
     PCLAY_OT_apply,
     PCLAY_OT_add_deform,
@@ -1293,6 +1539,7 @@ classes = (
     PCLAY_OT_studio_setup,
     PCLAY_OT_sync_viewport_color,
     VIEW3D_PT_procedural_clay,
+    VIEW3D_PT_procedural_clay_stop,
     VIEW3D_PT_procedural_clay_detail,
 )
 
@@ -1301,10 +1548,12 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Object.pclay_deform = PointerProperty(type=PCLAY_DeformSettings)
+    bpy.types.Scene.pclay_stop = PointerProperty(type=PCLAY_StopMotion)
 
 
 def unregister():
     del bpy.types.Object.pclay_deform
+    del bpy.types.Scene.pclay_stop
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
 
