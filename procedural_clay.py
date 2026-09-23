@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Procedural Clay",
     "author": "Ignacio Soler",
-    "version": (2, 3, 0),
+    "version": (2, 4, 0),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar (N) > Clay",
     "description": "UV-free procedural plasticine: material + silhouette deformation, tuned for EEVEE",
@@ -45,7 +45,7 @@ from bpy.props import (BoolProperty, FloatProperty, FloatVectorProperty, IntProp
 from bpy.types import Operator, Panel, PropertyGroup
 
 SHADER_GROUP = "PC_ClayShader"
-SHADER_VERSION = 3
+SHADER_VERSION = 4
 DEFORM_GROUP = "PC_ClayDeform"
 DEFORM_VERSION = 2
 NODE_NAME = "Clay Controls"
@@ -78,6 +78,11 @@ SHADER_INPUTS = [
      "How much the dents tint the base color"),
     ("Specks", "NodeSocketFloat", 0.25, 0.0, 1.0, True,
      "Tiny light flecks, like dust or bits of other clay pressed in"),
+    ("Fingerprints", "NodeSocketFloat", 0.3, 0.0, 1.0, True,
+     "Scattered finger presses with ridge lines. Ridges fade out with camera distance "
+     "so they never flicker"),
+    ("Print Size", "NodeSocketFloat", 0.12, 0.02, 0.5, False,
+     "Spacing of the prints relative to the object's size"),
     ("Texture Scale", "NodeSocketFloat", 1.0, 0.001, 100.0, False,
      "Global scale of all patterns. Raise it for large objects"),
     ("Seed", "NodeSocketFloat", 0.0, 0.0, 10000.0, False,
@@ -276,6 +281,107 @@ def _build_shader_group():
     b.link(grain_dist, bump3.inputs["Distance"])
     b.link(bump2.outputs["Normal"], bump3.inputs["Normal"])
 
+    # --- Fingerprints --------------------------------------------------------
+    # Voronoi scatters candidate spots; ~40% of cells get a print. Inside a
+    # cell, the vector from the cell point is randomly rotated and squashed
+    # into an ellipse; ridges are rings of that distance plus a little of the
+    # angle (turns rings into a loose whorl) and noise (breaks them up).
+    fx, fy = -50, -1200
+    fsize = b.node("ShaderNodeAttribute", fx - 400, fy, label="Object Size",
+                   attribute_type="OBJECT", attribute_name="pclay_size")
+    cell = b.math("MULTIPLY", fx - 220, fy, a=fsize.outputs["Fac"], b=I["Print Size"])
+    cell = b.math("MAXIMUM", fx - 60, fy, a=cell, b=0.0001, label="Print Cell Size")
+    inv_cell = b.math("DIVIDE", fx + 100, fy, a=1.0, b=cell)
+    pp = b.vmath("SCALE", fx + 260, fy, a=coords, scale=inv_cell, label="Print Space")
+
+    fv = b.node("ShaderNodeTexVoronoi", fx + 440, fy, label="Print Spots",
+                voronoi_dimensions="3D", feature="F1", distance="EUCLIDEAN")
+    b.link(pp, fv.inputs["Vector"])
+    fv.inputs["Scale"].default_value = 1.0
+    fv.inputs["Randomness"].default_value = 0.85
+    frand = b.node("ShaderNodeSeparateColor", fx + 640, fy - 200)
+    b.link(fv.outputs["Color"], frand.inputs["Color"])
+
+    local = b.vmath("SUBTRACT", fx + 640, fy, a=pp, b=fv.outputs["Position"])
+    rot = b.node("ShaderNodeVectorRotate", fx + 820, fy, rotation_type="EULER_XYZ")
+    b.link(local, rot.inputs["Vector"])
+    rot_angles = b.vmath("SCALE", fx + 640, fy + 200, a=fv.outputs["Color"], scale=6.2832)
+    b.link(rot_angles, rot.inputs["Rotation"])
+    ell = b.vmath("MULTIPLY", fx + 1000, fy, a=rot.outputs["Vector"], b=(1.0, 0.72, 1.0),
+                  label="Ellipse")
+    d = b.vmath("LENGTH", fx + 1180, fy, a=ell)
+    xyz = b.node("ShaderNodeSeparateXYZ", fx + 1180, fy - 200)
+    b.link(ell, xyz.inputs["Vector"])
+    ang = b.math("ARCTAN2", fx + 1360, fy - 200, a=xyz.outputs["Y"], b=xyz.outputs["X"])
+
+    # print radius (0.26-0.36 of a cell), randomised per print
+    radius = b.math("MULTIPLY_ADD", fx + 820, fy - 400, a=frand.outputs[2], b=0.1, c=0.26)
+    keep_p = b.math("GREATER_THAN", fx + 820, fy - 550, a=frand.outputs[0], b=0.6)
+    inner = b.math("MULTIPLY", fx + 1000, fy - 400, a=radius, b=0.55)
+    pmask = b.node("ShaderNodeMapRange", fx + 1360, fy - 400, label="Print Mask",
+                   clamp=True, interpolation_type="SMOOTHSTEP")
+    b.link(d, pmask.inputs["Value"])
+    b.link(inner, pmask.inputs["From Min"])
+    b.link(radius, pmask.inputs["From Max"])
+    pmask.inputs["To Min"].default_value = 1.0
+    pmask.inputs["To Max"].default_value = 0.0
+    breakup = b.node("ShaderNodeTexNoise", fx + 1180, fy - 700, label="Ridge Breakup",
+                     noise_dimensions="3D")
+    b.link(pp, breakup.inputs["Vector"])
+    breakup.inputs["Scale"].default_value = 9.0
+    breakup.inputs["Detail"].default_value = 1.0
+    part = b.node("ShaderNodeMapRange", fx + 1360, fy - 700, clamp=True)
+    b.link(breakup.outputs["Fac"], part.inputs["Value"])
+    part.inputs["From Min"].default_value = 0.35
+    part.inputs["From Max"].default_value = 0.6
+    pm = b.math("MULTIPLY", fx + 1540, fy - 400, a=pmask.outputs["Result"], b=keep_p)
+
+    # ridges: ~10 rings across the radius
+    freq = b.math("DIVIDE", fx + 1000, fy + 350, a=62.83, b=radius)   # 2*pi*10
+    phase = b.math("MULTIPLY", fx + 1360, fy + 150, a=d, b=freq)
+    phase = b.math("MULTIPLY_ADD", fx + 1540, fy + 150, a=ang, b=1.0, c=phase)
+    phase = b.math("MULTIPLY_ADD", fx + 1720, fy + 150, a=breakup.outputs["Fac"], b=6.0, c=phase)
+    ridge = b.math("SINE", fx + 1900, fy + 150, a=phase)
+    ridge = b.math("MULTIPLY_ADD", fx + 2080, fy + 150, a=ridge, b=0.5, c=0.5, label="Ridges")
+
+    # Distance fade: ridge wavelength vs. camera distance. Below ~2-3 px per
+    # ridge they would alias (shimmer in EEVEE), so fade them to nothing and
+    # keep only the soft press.
+    wave = b.math("DIVIDE", fx + 1180, fy + 350, a=radius, b=10.0)
+    wave = b.math("MULTIPLY", fx + 1360, fy + 350, a=wave, b=cell, label="Ridge Wavelength")
+    camd = b.node("ShaderNodeCameraData", fx + 1360, fy + 550)
+    ratio = b.math("DIVIDE", fx + 1540, fy + 450, a=wave, b=camd.outputs["View Distance"])
+    fade = b.node("ShaderNodeMapRange", fx + 1720, fy + 450, label="Ridge Fade", clamp=True)
+    b.link(ratio, fade.inputs["Value"])
+    fade.inputs["From Min"].default_value = 0.0008
+    fade.inputs["From Max"].default_value = 0.002
+
+    ridge_amt = b.math("MULTIPLY", fx + 2260, fy + 150, a=ridge, b=fade.outputs["Result"])
+    ridge_amt = b.math("MULTIPLY", fx + 2440, fy + 150, a=ridge_amt, b=part.outputs["Result"])
+    fp_strength = b.math("MULTIPLY", fx + 2620, fy - 250, a=I["Fingerprints"], b=pm)
+
+    # Two bumps, because the two features live at very different scales:
+    # the soft press spans the whole print, the ridges are ~1/10 of it.
+    # One shared bump distance would flatten one or make the other explode.
+    press_dist = b.math("MULTIPLY", fx + 2620, fy + 450, a=cell, b=0.06, label="Press Bump Dist")
+    bump_press = b.node("ShaderNodeBump", fx + 2800, fy + 200, label="Finger Press Bump",
+                        invert=True)
+    b.link(pm, bump_press.inputs["Height"])
+    b.link(I["Fingerprints"], bump_press.inputs["Strength"])
+    b.link(press_dist, bump_press.inputs["Distance"])
+    b.link(bump3.outputs["Normal"], bump_press.inputs["Normal"])
+
+    fp_h = b.math("MULTIPLY", fx + 2620, fy, a=ridge_amt, b=pm, label="Ridge Height")
+    fp_dist = b.math("MULTIPLY", fx + 2620, fy + 300, a=wave, b=0.35, label="Ridge Bump Dist")
+    bump_fp = b.node("ShaderNodeBump", fx + 2980, fy, label="Ridge Bump")
+    b.link(fp_h, bump_fp.inputs["Height"])
+    b.link(I["Fingerprints"], bump_fp.inputs["Strength"])
+    b.link(fp_dist, bump_fp.inputs["Distance"])
+    b.link(bump_press.outputs["Normal"], bump_fp.inputs["Normal"])
+    # grooves read slightly darker in the albedo
+    groove = b.math("SUBTRACT", fx + 2800, fy - 250, a=1.0, b=ridge_amt)
+    fp_cav = b.math("MULTIPLY", fx + 2980, fy - 250, a=groove, b=fp_strength)
+
     # Color: tint by lumps
     darker = b.node("ShaderNodeHueSaturation", 350, 1300, label="Darker Clay")
     b.link(I["Clay Color"], darker.inputs["Color"])
@@ -302,6 +408,7 @@ def _build_shader_group():
     fine = b.math("MULTIPLY_ADD", 720, 800, a=pore_mask, b=1.5, c=g_dark)
     fine = b.math("MULTIPLY", 890, 800, a=fine, b=I["Grain Intensity"])
     cav = b.math("MULTIPLY_ADD", 890, 950, a=low, b=1.6, c=fine)
+    cav = b.math("MULTIPLY_ADD", 960, 900, a=fp_cav, b=0.35, c=cav)
     cav = b.math("MULTIPLY", 1060, 950, a=cav, b=I["Cavity"], clamp=True, label="Cavity")
 
     mix_cav = b.node("ShaderNodeMix", 1150, 1150, label="Cavity Darken",
@@ -352,7 +459,7 @@ def _build_shader_group():
     bsdf = b.node("ShaderNodeBsdfPrincipled", 1300, 300)
     b.link(mix_sp.outputs[2], bsdf.inputs["Base Color"])
     b.link(rough, bsdf.inputs["Roughness"])
-    b.link(bump3.outputs["Normal"], bsdf.inputs["Normal"])
+    b.link(bump_fp.outputs["Normal"], bsdf.inputs["Normal"])
     _set_input(bsdf, "Specular IOR Level", 0.5)
     _set_input(bsdf, "Sheen Weight", 0.15)
     _set_input(bsdf, "Sheen Roughness", 0.5)
@@ -726,18 +833,19 @@ class PCLAY_OT_eevee_setup(Operator):
 
 
 PRESETS = {
-    # values: Roughness, Subsurface, Grain Intensity, Imperfection, Cavity, Pores, Specks, Color Variation
+    # values: Roughness, Subsurface, Grain Intensity, Imperfection, Cavity, Pores, Specks,
+    #         Color Variation, Fingerprints
     "PLAYDOH": ("Play-Doh", "Soft, slightly glossy, light bleeding through",
-                (0.5, 0.3, 0.25, 0.4, 0.35, 0.2, 0.25, 0.3)),
+                (0.5, 0.3, 0.25, 0.4, 0.35, 0.2, 0.25, 0.3, 0.3)),
     "SMOOTH": ("Smooth Clay", "Very soft and clean, almost no grain",
-               (0.45, 0.4, 0.12, 0.3, 0.25, 0.08, 0.1, 0.2)),
+               (0.45, 0.4, 0.12, 0.3, 0.25, 0.08, 0.1, 0.2, 0.15)),
     "PLASTICINE": ("Plasticine", "Oil-based modelling clay: matte, handled, more dents",
-                   (0.6, 0.15, 0.4, 0.6, 0.5, 0.35, 0.1, 0.4)),
+                   (0.6, 0.15, 0.4, 0.6, 0.5, 0.35, 0.1, 0.4, 0.6)),
     "TERRACOTTA": ("Dry Clay", "Air-dry / terracotta: very matte, porous, no translucency",
-                   (0.85, 0.0, 0.6, 0.5, 0.6, 0.5, 0.4, 0.5)),
+                   (0.85, 0.0, 0.6, 0.5, 0.6, 0.5, 0.4, 0.5, 0.35)),
 }
 PRESET_KEYS = ("Roughness", "Subsurface", "Grain Intensity", "Imperfection", "Cavity",
-               "Pores", "Specks", "Color Variation")
+               "Pores", "Specks", "Color Variation", "Fingerprints")
 
 
 class PCLAY_OT_preset(Operator):
@@ -975,7 +1083,8 @@ class VIEW3D_PT_procedural_clay(Panel):
                 row.label(text=f"{users} users")
             box.operator_menu_enum(PCLAY_OT_preset.bl_idname, "preset", text="Preset", icon="PRESET")
             col = _split_col(box)
-            for name in ("Clay Color", "Roughness", "Subsurface", "Grain Intensity", "Imperfection"):
+            for name in ("Clay Color", "Roughness", "Subsurface", "Grain Intensity", "Imperfection",
+                         "Fingerprints"):
                 if name in node.inputs:  # older materials may lack newer inputs
                     col.prop(node.inputs[name], "default_value", text=name)
 
@@ -1012,7 +1121,7 @@ class VIEW3D_PT_procedural_clay_detail(Panel):
         if node is not None:
             layout.label(text="Surface", icon="MATERIAL")
             col = _split_col(layout)
-            for name in ("Cavity", "Specks", "Imperfection Scale", "Grain Scale", "Pores",
+            for name in ("Cavity", "Specks", "Print Size", "Imperfection Scale", "Grain Scale", "Pores",
                          "Color Variation", "Texture Scale"):
                 if name in node.inputs:  # older materials may lack newer inputs
                     col.prop(node.inputs[name], "default_value", text=name)

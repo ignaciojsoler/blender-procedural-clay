@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.4.0
+- **Fingerprints**: scattered finger presses with whorl-like ridges (Voronoi-placed, random rotation/size, elliptical, broken up by noise). Two bumps: a soft press sized to the print and ridges sized to their wavelength.
+- Ridges fade with camera distance before they get smaller than ~2-3 px, so they never shimmer in EEVEE; the soft press stays.
+- **Print Size** is relative to each object's size. Presets include fingerprint amounts.
+
 ## 2.3.0
 - **Studio Setup**: one click builds a product-shot scene around the selection: seamless curved backdrop tinted from the clay color, soft key/fill/rim area lights, 85mm camera with depth of field, AgX, EEVEE settings. Scales with the subject, re-running rebuilds it.
 - **Presets**: Play-Doh, Smooth Clay, Plasticine, Dry Clay (surface sliders only, color is kept).
