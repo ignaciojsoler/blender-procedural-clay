@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.6.1
+- Boil was far too subtle (~0.1% of object size between poses). It is now its own displacement layer with a fresh noise lookup per pose: ~0.5% mean / 2% peak at Boil 0.5, and it works even with Deformation at 0. Shader boil offset 5x stronger.
+- Toggling Stop Motion upgrades every clay material and Clay Deform modifier in the file, so it works without re-running Apply Clay.
+
 ## 2.6.0
 - **Sticky textures**: Apply Clay turns on the object's Rest Position; Clay Deform samples its noise and measures size/density on the rest pose and stores it as `pc_coords` (+ `pc_has` flag) for the shader. Texture, fingerprints and lumps stay glued to the surface under armatures and shape keys, and nothing pops between frames. Objects without the modifier fall back to Object coordinates.
 - **Stop Motion** panel (scene-wide): Hold Frames (on 2s by default) and Boil. Lumps and surface detail jump to a new random state every held pose, like clay touched between shots. The shader is driven by simple-expression drivers (no Python auto-run needed).

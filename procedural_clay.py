@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Procedural Clay",
     "author": "Ignacio Soler",
-    "version": (2, 6, 0),
+    "version": (2, 6, 1),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar (N) > Clay",
     "description": "UV-free procedural plasticine: material + silhouette deformation, tuned for EEVEE",
@@ -46,9 +46,9 @@ from bpy.props import (BoolProperty, FloatProperty, FloatVectorProperty, IntProp
 from bpy.types import Operator, Panel, PropertyGroup
 
 SHADER_GROUP = "PC_ClayShader"
-SHADER_VERSION = 6
+SHADER_VERSION = 7
 DEFORM_GROUP = "PC_ClayDeform"
-DEFORM_VERSION = 4
+DEFORM_VERSION = 5
 NODE_NAME = "Clay Controls"
 MOD_NAME = "Clay Deform"
 MAT_TAG = "procedural_clay"
@@ -358,7 +358,7 @@ def _build_shader_group():
     b.link(I["Boil Frame"], bwn.inputs["W"])
     bcent = b.vmath("SUBTRACT", -1820, 0, a=bwn.outputs["Color"], b=(0.5, 0.5, 0.5))
     bamt = b.math("MULTIPLY", -1820, -200, a=I["Boil Amount"], b=bsize.outputs["Fac"])
-    bamt = b.math("MULTIPLY", -1640, -200, a=bamt, b=0.03)
+    bamt = b.math("MULTIPLY", -1640, -200, a=bamt, b=0.15)
     boff = b.vmath("SCALE", -1640, 0, a=bcent, scale=bamt, label="Boil Offset")
     base = b.vmath("ADD", -1600, 300, a=mixc.outputs[1], b=boff)
     scaled = b.vmath("SCALE", -1400, 350, a=base, scale=I["Texture Scale"])
@@ -654,9 +654,18 @@ def _build_deform_group():
     gwn = b.node("ShaderNodeTexWhiteNoise", 20, -1100, label="Boil Hash", noise_dimensions="1D")
     b.link(sidx, gwn.inputs["W"])
     gcent = b.vmath("SUBTRACT", 200, -1100, a=gwn.outputs["Color"], b=(0.5, 0.5, 0.5))
-    gj = b.math("MULTIPLY", 200, -1250, a=I["Boil"], b=0.6)
-    gjit = b.vmath("SCALE", 380, -1100, a=gcent, scale=gj, label="Boil Jitter")
-    p = b.vmath("ADD", 60, -700, a=p, b=gjit)
+    # A separate layer (not a shift of the lumps): works even with
+    # Deformation at 0, and each pose looks up a completely new noise region.
+    gjit = b.vmath("SCALE", 380, -1100, a=gcent, scale=40.0, label="Pose Offset")
+    bp = b.vmath("ADD", 560, -1100, a=p, b=gjit)
+    bnoise = b.node("ShaderNodeTexNoise", 740, -1100, label="Boil Noise", noise_dimensions="3D")
+    b.link(bp, bnoise.inputs["Vector"])
+    bnoise.inputs["Scale"].default_value = 1.3
+    bnoise.inputs["Detail"].default_value = 1.0
+    hb = b.math("MULTIPLY_ADD", 920, -1100, a=bnoise.outputs["Fac"], b=2.0, c=-1.0)
+    bamp = b.math("MULTIPLY", 920, -1250, a=I["Boil"], b=size)
+    bamp = b.math("MULTIPLY", 1100, -1250, a=bamp, b=0.05, label="Boil Amplitude")
+    boil_disp = b.math("MULTIPLY", 1100, -1100, a=hb, b=bamp)
 
     # Lumps are sized relative to the object (Lump Size = fraction of its
     # diagonal). They must stay well below the object's size: noise at a
@@ -687,6 +696,7 @@ def _build_deform_group():
     amp = b.math("MULTIPLY", 600, -300, a=amp, b=I["Lump Size"])
     amp = b.math("MULTIPLY", 770, -300, a=amp, b=0.22)
     disp = b.math("MULTIPLY", 700, -500, a=h, b=amp)
+    disp = b.math("ADD", 1280, -700, a=disp, b=boil_disp, label="Total Offset")
 
     normal = b.node("GeometryNodeInputNormal", 430, -150)
     blur = b.node("GeometryNodeBlurAttribute", 560, -50, data_type="FLOAT_VECTOR",
@@ -856,7 +866,18 @@ def _all_clay_deform_objects():
 
 
 def _on_stop_change(self, context):
+    # Upgrade everything in the scene so stop motion works without having to
+    # re-run Apply Clay on objects made with an older version.
+    for mat in bpy.data.materials:
+        if find_clay_node(mat) is not None:
+            upgrade_clay_material(mat)
+            ensure_boil_drivers(mat, context.scene)
+    group = _get_group(DEFORM_GROUP, DEFORM_VERSION, _build_deform_group)
     for obj in _all_clay_deform_objects():
+        mod = find_deform_mod(obj)
+        if mod.node_group is not group:
+            mod.node_group = group
+        enable_rest_position(obj)
         push_deform_settings(obj)
     # material drivers read these props directly; just make sure they re-evaluate
     for mat in bpy.data.materials:
