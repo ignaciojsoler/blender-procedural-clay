@@ -4,7 +4,7 @@
 bl_info = {
     "name": "Procedural Clay",
     "author": "Ignacio Soler",
-    "version": (2, 8, 0),
+    "version": (0, 9, 0),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar (N) > Clay",
     "description": "UV-free procedural plasticine: material + silhouette deformation, tuned for EEVEE",

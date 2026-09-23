@@ -41,7 +41,7 @@ Tips:
 
 - Blender 5.2 (Linux, AMD integrated GPU) by the author.
 - Blender 5.0, headless automated tests (material, deform, stop motion, extension install).
-- Minimum version is 4.2, but 4.x has not been re-tested since 2.1.
+- Minimum version is 4.2, but 4.x has not been re-tested recently.
 
 Not yet tested on Windows, macOS or NVIDIA. Reports welcome in [Issues](../../issues).
 
