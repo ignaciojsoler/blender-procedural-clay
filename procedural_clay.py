@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Procedural Clay",
     "author": "Ignacio Soler",
-    "version": (2, 4, 0),
+    "version": (2, 5, 0),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar (N) > Clay",
     "description": "UV-free procedural plasticine: material + silhouette deformation, tuned for EEVEE",
@@ -37,6 +37,7 @@ Two independent parts, both UV-free and driven by object-space position:
    works identically in EEVEE, Cycles and Solid view.
 """
 
+import os
 import random
 
 import bpy
@@ -45,12 +46,16 @@ from bpy.props import (BoolProperty, FloatProperty, FloatVectorProperty, IntProp
 from bpy.types import Operator, Panel, PropertyGroup
 
 SHADER_GROUP = "PC_ClayShader"
-SHADER_VERSION = 4
+SHADER_VERSION = 5
 DEFORM_GROUP = "PC_ClayDeform"
-DEFORM_VERSION = 2
+DEFORM_VERSION = 3
 NODE_NAME = "Clay Controls"
 MOD_NAME = "Clay Deform"
 MAT_TAG = "procedural_clay"
+FP_NODE = "PC Fingerprint Map"
+FP_IMAGE = "PC_Fingerprints"
+FP_CACHE = "fingerprints_v1.png"
+FP_RES = 2048
 
 # (name, socket type, default, min, max, factor subtype, tooltip)
 SHADER_INPUTS = [
@@ -79,10 +84,10 @@ SHADER_INPUTS = [
     ("Specks", "NodeSocketFloat", 0.25, 0.0, 1.0, True,
      "Tiny light flecks, like dust or bits of other clay pressed in"),
     ("Fingerprints", "NodeSocketFloat", 0.3, 0.0, 1.0, True,
-     "Scattered finger presses with ridge lines. Ridges fade out with camera distance "
-     "so they never flicker"),
+     "Overlapping finger smudges with ridge lines, like handled clay. Shows mostly "
+     "in the highlights"),
     ("Print Size", "NodeSocketFloat", 0.12, 0.02, 0.5, False,
-     "Spacing of the prints relative to the object's size"),
+     "Size of the finger prints relative to the object's size"),
     ("Texture Scale", "NodeSocketFloat", 1.0, 0.001, 100.0, False,
      "Global scale of all patterns. Raise it for large objects"),
     ("Seed", "NodeSocketFloat", 0.0, 0.0, 10000.0, False,
@@ -96,8 +101,9 @@ DEFORM_INPUTS = [
      "Size of the deformation bumps relative to the object"),
     ("Detail", "NodeSocketFloat", 0.2, 0.0, 1.0, True,
      "Adds smaller dents on top of the big lumps"),
-    ("Subdivisions", "NodeSocketInt", 2, 0, 6, False,
-     "Extra mesh density so the deformation is smooth. Each level x4 faces"),
+    ("Subdivisions", "NodeSocketInt", 3, 0, 5, False,
+     "Maximum extra subdivision levels. The modifier adds only what the mesh needs "
+     "(none on dense meshes). Each level x4 faces"),
     ("Seed", "NodeSocketFloat", 0.0, 0.0, 10000.0, False,
      "Changes the deformation pattern"),
 ]
@@ -144,7 +150,7 @@ class _Builder:
                 self._feed(n.inputs[i], v)
         if scale is not None:
             self._feed(n.inputs["Scale"], scale)
-        return n.outputs["Vector"] if op != "LENGTH" else n.outputs["Value"]
+        return n.outputs["Value"] if op in ("LENGTH", "DISTANCE", "DOT_PRODUCT") else n.outputs["Vector"]
 
     def seed_offset(self, seed_sock, x, y, spread=50.0):
         """Seed -> bounded random vector. Adding a raw seed to coordinates
@@ -189,6 +195,120 @@ def _get_group(name, version, builder):
     if ng is not None:
         ng.name = name + "_old"  # older materials keep working
     return builder()
+
+
+# --------------------------------------------------------------------------
+# Fingerprint map: generated once with numpy, cached on disk, packed in .blend
+# --------------------------------------------------------------------------
+
+def _periodic_noise(np, rng, size, sigma_px):
+    """Tileable smooth noise: white noise low-passed in the frequency domain
+    (periodic by construction, so the map tiles without seams)."""
+    f = np.fft.fftfreq(size)
+    fx, fy = np.meshgrid(f, f)
+    g = np.exp(-(fx ** 2 + fy ** 2) * (2 * np.pi ** 2) * sigma_px ** 2)
+    n = np.real(np.fft.ifft2(np.fft.fft2(rng.standard_normal((size, size))) * g))
+    return ((n - n.mean()) / (n.std() + 1e-8)).astype(np.float32)
+
+
+def generate_fingerprint_map(size=FP_RES, count=600, seed=7):
+    """Tileable map of overlapping finger smudges. Each smudge: ragged oval
+    outline, ridges = rings around an off-centre core bent by smooth noise
+    (gives loops/whorls), ridges only in patches, light speckle; smudges are
+    screen-blended so overlaps build up like repeated handling."""
+    import numpy as np
+    rng = np.random.default_rng(seed)
+    s = size / 2048.0
+    warp = _periodic_noise(np, rng, size, 14 * s)
+    warp2 = _periodic_noise(np, rng, size, 30 * s)
+    grain = _periodic_noise(np, rng, size, 1.2 * s)
+    ragged = _periodic_noise(np, rng, size, 4 * s)
+    cloud = _periodic_noise(np, rng, size, 160 * s)
+    img = np.zeros((size, size), np.float32)
+    for _ in range(count):
+        cx, cy = rng.uniform(0, size, 2)
+        r = rng.uniform(50, 105) * s
+        rot = rng.uniform(0, np.pi)
+        squash = rng.uniform(0.6, 0.85)
+        opacity = rng.uniform(0.05, 0.38)
+        lam = rng.uniform(4.2, 5.6) * s
+        whorl = rng.uniform(-1.2, 1.2)
+        off = rng.uniform(-0.25, 0.25, 2) * r
+        ridge_amt = rng.uniform(0.25, 0.85)
+        core_dark = rng.uniform(0, 1)
+        R = int(r * 1.4) + 2
+        xs = np.arange(int(cx) - R, int(cx) + R)
+        ys = np.arange(int(cy) - R, int(cy) + R)
+        sl = np.ix_(ys % size, xs % size)
+        dx = (xs - cx)[None, :]
+        dy = (ys - cy)[:, None]
+        c, sn = np.cos(rot), np.sin(rot)
+        u = dx * c + dy * sn
+        v = (-dx * sn + dy * c) / squash
+        d = np.sqrt(u * u + v * v)
+        ang = np.arctan2(v, u)
+        edge = r * (1 + 0.07 * np.sin(3 * ang + rot) + 0.05 * np.sin(5 * ang + 2 * rot)) \
+            + ragged[sl] * 5 * s
+        mask = np.clip((1.0 - d / edge) / 0.6, 0, 1)
+        mask = mask * mask * (3 - 2 * mask)
+        pu, pv = u - off[0], v - off[1]
+        dd = np.sqrt(pu * pu + pv * pv) + warp[sl] * 2.2 * lam + warp2[sl] * 3.5 * lam
+        ridges = 0.5 + 0.5 * np.sin(2 * np.pi * dd / lam + whorl * np.arctan2(pv, pu))
+        frag = np.clip(0.5 + 0.5 * warp2[sl], 0, 1)
+        speck = 0.85 + 0.12 * np.clip(grain[sl], -1.5, 1.5)
+        body = (0.5 + 0.5 * (ridges * frag * ridge_amt + (1 - ridge_amt * frag) * 0.5)) * speck
+        body *= 1 - 0.35 * np.clip(1 - d / (edge * 0.4), 0, 1) * core_dark
+        val = body * mask * opacity
+        img[sl] = 1 - (1 - img[sl]) * (1 - val)
+    img += 0.05 * np.clip(cloud, -1, 2)
+    img = np.clip(img, 0, None)
+    img = np.clip(img / (np.percentile(img, 99.9) + 1e-6), 0, 1) ** 0.9
+    return img
+
+
+def _fp_cache_path():
+    folder = bpy.utils.user_resource("DATAFILES", path="procedural_clay", create=True)
+    return os.path.join(folder, FP_CACHE)
+
+
+def get_fingerprint_image():
+    """Return the fingerprint image: already in the file, else from the disk
+    cache, else generate it (one-time, a few seconds) and cache it."""
+    img = bpy.data.images.get(FP_IMAGE)
+    if img is not None and img.has_data:
+        return img
+    if img is not None:
+        bpy.data.images.remove(img)
+    path = _fp_cache_path()
+    if os.path.isfile(path):
+        img = bpy.data.images.load(path, check_existing=False)
+        img.name = FP_IMAGE
+    else:
+        import numpy as np
+        data = generate_fingerprint_map()
+        img = bpy.data.images.new(FP_IMAGE, FP_RES, FP_RES, alpha=False, float_buffer=False)
+        rgba = np.empty((FP_RES, FP_RES, 4), np.float32)
+        rgba[..., 0] = rgba[..., 1] = rgba[..., 2] = data
+        rgba[..., 3] = 1.0
+        img.pixels.foreach_set(rgba.ravel())
+        img.filepath_raw = path
+        img.file_format = "PNG"
+        try:
+            img.save()
+        except RuntimeError:
+            pass  # cache is an optimisation; packing below keeps the file self-contained
+    img.colorspace_settings.name = "Non-Color"
+    try:
+        img.pack()
+    except RuntimeError:
+        pass
+    return img
+
+
+def ensure_fingerprint_image(group):
+    node = group.nodes.get(FP_NODE) if group else None
+    if node is not None and (node.image is None or not node.image.has_data):
+        node.image = get_fingerprint_image()
 
 
 # --------------------------------------------------------------------------
@@ -281,106 +401,39 @@ def _build_shader_group():
     b.link(grain_dist, bump3.inputs["Distance"])
     b.link(bump2.outputs["Normal"], bump3.inputs["Normal"])
 
-    # --- Fingerprints --------------------------------------------------------
-    # Voronoi scatters candidate spots; ~40% of cells get a print. Inside a
-    # cell, the vector from the cell point is randomly rotated and squashed
-    # into an ellipse; ridges are rings of that distance plus a little of the
-    # angle (turns rings into a loose whorl) and noise (breaks them up).
+    # --- Fingerprints (image based) -----------------------------------------
+    # A pre-generated tileable map of overlapping finger smudges with real
+    # ridge patterns, box-projected in object space (no UVs). An image rather
+    # than nodes because ridges are finer than a pixel at normal viewing
+    # distances: textures get mipmapped/filtered by Blender, procedural nodes
+    # don't, so an image never shimmers in EEVEE and costs one lookup.
     fx, fy = -50, -1200
     fsize = b.node("ShaderNodeAttribute", fx - 400, fy, label="Object Size",
                    attribute_type="OBJECT", attribute_name="pclay_size")
-    cell = b.math("MULTIPLY", fx - 220, fy, a=fsize.outputs["Fac"], b=I["Print Size"])
-    cell = b.math("MAXIMUM", fx - 60, fy, a=cell, b=0.0001, label="Print Cell Size")
-    inv_cell = b.math("DIVIDE", fx + 100, fy, a=1.0, b=cell)
-    pp = b.vmath("SCALE", fx + 260, fy, a=coords, scale=inv_cell, label="Print Space")
+    tile = b.math("MULTIPLY", fx - 220, fy, a=fsize.outputs["Fac"], b=I["Print Size"])
+    tile = b.math("MULTIPLY", fx - 60, fy, a=tile, b=10.0)
+    tile = b.math("MAXIMUM", fx + 100, fy, a=tile, b=0.0001, label="Print Tile Size")
+    inv_tile = b.math("DIVIDE", fx + 260, fy, a=1.0, b=tile)
+    fp_vec = b.vmath("SCALE", fx + 420, fy, a=coords, scale=inv_tile, label="Print Space")
+    fimg = b.node("ShaderNodeTexImage", fx + 600, fy, label="Fingerprint Map",
+                  projection="BOX", interpolation="Linear", extension="REPEAT")
+    fimg.name = FP_NODE
+    fimg.projection_blend = 0.35
+    fimg.image = get_fingerprint_image()
+    b.link(fp_vec, fimg.inputs["Vector"])
+    fp = fimg.outputs["Color"]
+    fp_strength = b.math("MULTIPLY", fx + 900, fy - 250, a=fp, b=I["Fingerprints"],
+                         label="Print Amount")
 
-    fv = b.node("ShaderNodeTexVoronoi", fx + 440, fy, label="Print Spots",
-                voronoi_dimensions="3D", feature="F1", distance="EUCLIDEAN")
-    b.link(pp, fv.inputs["Vector"])
-    fv.inputs["Scale"].default_value = 1.0
-    fv.inputs["Randomness"].default_value = 0.85
-    frand = b.node("ShaderNodeSeparateColor", fx + 640, fy - 200)
-    b.link(fv.outputs["Color"], frand.inputs["Color"])
-
-    local = b.vmath("SUBTRACT", fx + 640, fy, a=pp, b=fv.outputs["Position"])
-    rot = b.node("ShaderNodeVectorRotate", fx + 820, fy, rotation_type="EULER_XYZ")
-    b.link(local, rot.inputs["Vector"])
-    rot_angles = b.vmath("SCALE", fx + 640, fy + 200, a=fv.outputs["Color"], scale=6.2832)
-    b.link(rot_angles, rot.inputs["Rotation"])
-    ell = b.vmath("MULTIPLY", fx + 1000, fy, a=rot.outputs["Vector"], b=(1.0, 0.72, 1.0),
-                  label="Ellipse")
-    d = b.vmath("LENGTH", fx + 1180, fy, a=ell)
-    xyz = b.node("ShaderNodeSeparateXYZ", fx + 1180, fy - 200)
-    b.link(ell, xyz.inputs["Vector"])
-    ang = b.math("ARCTAN2", fx + 1360, fy - 200, a=xyz.outputs["Y"], b=xyz.outputs["X"])
-
-    # print radius (0.26-0.36 of a cell), randomised per print
-    radius = b.math("MULTIPLY_ADD", fx + 820, fy - 400, a=frand.outputs[2], b=0.1, c=0.26)
-    keep_p = b.math("GREATER_THAN", fx + 820, fy - 550, a=frand.outputs[0], b=0.6)
-    inner = b.math("MULTIPLY", fx + 1000, fy - 400, a=radius, b=0.55)
-    pmask = b.node("ShaderNodeMapRange", fx + 1360, fy - 400, label="Print Mask",
-                   clamp=True, interpolation_type="SMOOTHSTEP")
-    b.link(d, pmask.inputs["Value"])
-    b.link(inner, pmask.inputs["From Min"])
-    b.link(radius, pmask.inputs["From Max"])
-    pmask.inputs["To Min"].default_value = 1.0
-    pmask.inputs["To Max"].default_value = 0.0
-    breakup = b.node("ShaderNodeTexNoise", fx + 1180, fy - 700, label="Ridge Breakup",
-                     noise_dimensions="3D")
-    b.link(pp, breakup.inputs["Vector"])
-    breakup.inputs["Scale"].default_value = 9.0
-    breakup.inputs["Detail"].default_value = 1.0
-    part = b.node("ShaderNodeMapRange", fx + 1360, fy - 700, clamp=True)
-    b.link(breakup.outputs["Fac"], part.inputs["Value"])
-    part.inputs["From Min"].default_value = 0.35
-    part.inputs["From Max"].default_value = 0.6
-    pm = b.math("MULTIPLY", fx + 1540, fy - 400, a=pmask.outputs["Result"], b=keep_p)
-
-    # ridges: ~10 rings across the radius
-    freq = b.math("DIVIDE", fx + 1000, fy + 350, a=62.83, b=radius)   # 2*pi*10
-    phase = b.math("MULTIPLY", fx + 1360, fy + 150, a=d, b=freq)
-    phase = b.math("MULTIPLY_ADD", fx + 1540, fy + 150, a=ang, b=1.0, c=phase)
-    phase = b.math("MULTIPLY_ADD", fx + 1720, fy + 150, a=breakup.outputs["Fac"], b=6.0, c=phase)
-    ridge = b.math("SINE", fx + 1900, fy + 150, a=phase)
-    ridge = b.math("MULTIPLY_ADD", fx + 2080, fy + 150, a=ridge, b=0.5, c=0.5, label="Ridges")
-
-    # Distance fade: ridge wavelength vs. camera distance. Below ~2-3 px per
-    # ridge they would alias (shimmer in EEVEE), so fade them to nothing and
-    # keep only the soft press.
-    wave = b.math("DIVIDE", fx + 1180, fy + 350, a=radius, b=10.0)
-    wave = b.math("MULTIPLY", fx + 1360, fy + 350, a=wave, b=cell, label="Ridge Wavelength")
-    camd = b.node("ShaderNodeCameraData", fx + 1360, fy + 550)
-    ratio = b.math("DIVIDE", fx + 1540, fy + 450, a=wave, b=camd.outputs["View Distance"])
-    fade = b.node("ShaderNodeMapRange", fx + 1720, fy + 450, label="Ridge Fade", clamp=True)
-    b.link(ratio, fade.inputs["Value"])
-    fade.inputs["From Min"].default_value = 0.0008
-    fade.inputs["From Max"].default_value = 0.002
-
-    ridge_amt = b.math("MULTIPLY", fx + 2260, fy + 150, a=ridge, b=fade.outputs["Result"])
-    ridge_amt = b.math("MULTIPLY", fx + 2440, fy + 150, a=ridge_amt, b=part.outputs["Result"])
-    fp_strength = b.math("MULTIPLY", fx + 2620, fy - 250, a=I["Fingerprints"], b=pm)
-
-    # Two bumps, because the two features live at very different scales:
-    # the soft press spans the whole print, the ridges are ~1/10 of it.
-    # One shared bump distance would flatten one or make the other explode.
-    press_dist = b.math("MULTIPLY", fx + 2620, fy + 450, a=cell, b=0.06, label="Press Bump Dist")
-    bump_press = b.node("ShaderNodeBump", fx + 2800, fy + 200, label="Finger Press Bump",
-                        invert=True)
-    b.link(pm, bump_press.inputs["Height"])
-    b.link(I["Fingerprints"], bump_press.inputs["Strength"])
-    b.link(press_dist, bump_press.inputs["Distance"])
-    b.link(bump3.outputs["Normal"], bump_press.inputs["Normal"])
-
-    fp_h = b.math("MULTIPLY", fx + 2620, fy, a=ridge_amt, b=pm, label="Ridge Height")
-    fp_dist = b.math("MULTIPLY", fx + 2620, fy + 300, a=wave, b=0.35, label="Ridge Bump Dist")
-    bump_fp = b.node("ShaderNodeBump", fx + 2980, fy, label="Ridge Bump")
-    b.link(fp_h, bump_fp.inputs["Height"])
+    # bump distance ~ 1.5 texels of the map, so ridge relief stays constant
+    fp_dist = b.math("MULTIPLY", fx + 900, fy + 250, a=tile, b=1.5 / 2048.0)
+    bump_fp = b.node("ShaderNodeBump", fx + 1100, fy, label="Fingerprint Bump")
+    b.link(fp, bump_fp.inputs["Height"])
     b.link(I["Fingerprints"], bump_fp.inputs["Strength"])
     b.link(fp_dist, bump_fp.inputs["Distance"])
-    b.link(bump_press.outputs["Normal"], bump_fp.inputs["Normal"])
-    # grooves read slightly darker in the albedo
-    groove = b.math("SUBTRACT", fx + 2800, fy - 250, a=1.0, b=ridge_amt)
-    fp_cav = b.math("MULTIPLY", fx + 2980, fy - 250, a=groove, b=fp_strength)
+    b.link(bump3.outputs["Normal"], bump_fp.inputs["Normal"])
+    # touched clay is slightly polished: prints show mostly in the highlights
+    fp_cav = b.math("MULTIPLY", fx + 1100, fy - 250, a=fp_strength, b=0.2)
 
     # Color: tint by lumps
     darker = b.node("ShaderNodeHueSaturation", 350, 1300, label="Darker Clay")
@@ -420,7 +473,8 @@ def _build_shader_group():
     # Roughness broken up by grain, pores a bit rougher
     gc = b.math("SUBTRACT", 550, -500, a=grain.outputs["Fac"], b=0.5)
     rough = b.math("MULTIPLY_ADD", 720, -500, a=gc, b=0.2, c=I["Roughness"])
-    rough = b.math("MULTIPLY_ADD", 890, -500, a=pore_mask, b=0.1, c=rough, clamp=True)
+    rough = b.math("MULTIPLY_ADD", 890, -500, a=pore_mask, b=0.1, c=rough)
+    rough = b.math("MULTIPLY_ADD", 1060, -500, a=fp_strength, b=-0.22, c=rough, clamp=True)
 
     # Specks: a sparse subset of small Voronoi cells gets a lighter dot
     spv = b.node("ShaderNodeTexVoronoi", 700, 1600, label="Specks",
@@ -492,9 +546,40 @@ def _build_deform_group():
     size = b.vmath("LENGTH", -820, -300, a=diag)
     size = b.math("MAXIMUM", -650, -300, a=size, b=0.0001, label="Object Size")
 
+    # Adaptive subdivision. Each level multiplies faces by 4, so a fixed level
+    # on a mesh that is already dense (e.g. after a Subdivision Surface
+    # modifier) explodes memory, in the viewport too. Instead: measure the mean
+    # edge length and add only the levels needed to get ~8 vertices per lump;
+    # "Subdivisions" is the upper limit.
+    ev = b.node("GeometryNodeInputMeshEdgeVertices", -1600, 450)
+    elen = b.vmath("DISTANCE", -1420, 450, a=ev.outputs["Position 1"], b=ev.outputs["Position 2"])
+    stat = b.node("GeometryNodeAttributeStatistic", -1240, 450, data_type="FLOAT", domain="EDGE")
+    b.link(I["Geometry"], stat.inputs["Geometry"])
+    b.link(elen, stat.inputs["Attribute"])
+    mean_edge = b.math("MAXIMUM", -1060, 450, a=stat.outputs["Mean"], b=0.000001, label="Mean Edge")
+    lump_len = b.math("MULTIPLY", -1060, 300, a=size, b=I["Lump Size"])
+    target = b.math("DIVIDE", -880, 300, a=lump_len, b=8.0, label="Target Edge")
+    ratio = b.math("DIVIDE", -880, 450, a=mean_edge, b=target)
+    ratio = b.math("MAXIMUM", -700, 450, a=ratio, b=1.0)
+    need = b.math("LOGARITHM", -520, 450, a=ratio, b=2.0)
+    need = b.math("CEIL", -340, 450, a=need)
+    level = b.math("MINIMUM", -160, 450, a=need, b=I["Subdivisions"], label="Auto Level")
+
     subdiv = b.node("GeometryNodeSubdivideMesh", -1000, 100)
     b.link(I["Geometry"], subdiv.inputs["Mesh"])
-    b.link(I["Subdivisions"], subdiv.inputs["Level"])
+    b.link(level, subdiv.inputs["Level"])
+
+    # Smoothed normals. Pushing along the raw normal tears concave creases
+    # (inset + extrude, mouths, eye sockets): vertices on each side of the
+    # crease move in different directions and cut through each other.
+    # Blurring the normal over a distance comparable to a lump makes both
+    # sides move together, so the surface stays whole.
+    edge_after = b.math("POWER", 20, 450, a=2.0, b=level)
+    edge_after = b.math("DIVIDE", 200, 450, a=mean_edge, b=edge_after)
+    hops = b.math("MULTIPLY", 200, 300, a=lump_len, b=0.35)
+    hops = b.math("DIVIDE", 380, 350, a=hops, b=edge_after)
+    hops = b.math("MINIMUM", 560, 350, a=hops, b=40.0)
+    hops = b.math("MAXIMUM", 740, 350, a=hops, b=2.0, label="Blur Iterations")
 
     # Noise sampled in object space normalised by size -> size-independent look
     pos = b.node("GeometryNodeInputPosition", -1000, -600)
@@ -534,7 +619,12 @@ def _build_deform_group():
     disp = b.math("MULTIPLY", 700, -500, a=h, b=amp)
 
     normal = b.node("GeometryNodeInputNormal", 430, -150)
-    off = b.vmath("SCALE", 700, -150, a=normal.outputs["Normal"], scale=disp)
+    blur = b.node("GeometryNodeBlurAttribute", 560, -50, data_type="FLOAT_VECTOR",
+                  label="Smooth Normals")
+    b.link(normal.outputs["Normal"], blur.inputs["Value"])
+    b.link(hops, blur.inputs["Iterations"])
+    smooth_n = b.vmath("NORMALIZE", 740, -50, a=blur.outputs["Value"])
+    off = b.vmath("SCALE", 900, -150, a=smooth_n, scale=disp)
 
     setpos = b.node("GeometryNodeSetPosition", 700, 100)
     b.link(subdiv.outputs["Mesh"], setpos.inputs["Geometry"])
@@ -557,6 +647,7 @@ def create_clay_material(color, seed):
 
     grp = nt.nodes.new("ShaderNodeGroup")
     grp.node_tree = _get_group(SHADER_GROUP, SHADER_VERSION, _build_shader_group)
+    ensure_fingerprint_image(grp.node_tree)
     grp.name = grp.label = NODE_NAME
     grp.width = 220
     grp.inputs["Clay Color"].default_value = color
@@ -585,6 +676,7 @@ def upgrade_clay_material(mat):
     the values of every input that still exists."""
     node = find_clay_node(mat)
     group = _get_group(SHADER_GROUP, SHADER_VERSION, _build_shader_group)
+    ensure_fingerprint_image(group)
     if node is None or node.node_tree is group:
         return
     saved = {}
@@ -679,9 +771,10 @@ class PCLAY_DeformSettings(PropertyGroup):
     detail: FloatProperty(name="Detail", default=0.2, min=0.0, max=1.0, subtype="FACTOR",
                           update=_on_deform_change,
                           description="Smaller dents on top of the big lumps")
-    subdivisions: IntProperty(name="Subdivisions", default=2, min=0, max=6,
+    subdivisions: IntProperty(name="Max Subdivisions", default=3, min=0, max=5,
                               update=_on_deform_change,
-                              description="Extra mesh density. Each level x4 faces")
+                              description="Upper limit for the automatic extra subdivision. "
+                                          "Dense meshes get none. Each level x4 faces")
     seed: FloatProperty(name="Seed", default=0.0, min=0.0, max=10000.0,
                         update=_on_deform_change)
 
@@ -817,12 +910,19 @@ class PCLAY_OT_eevee_setup(Operator):
                           ("use_fast_gi", True),      # horizon scan: AO in the dents
                           ("fast_gi_distance", 0.3),
                           ("use_shadows", True),
-                          ("use_shadow_jitter_viewport", True)):  # soft shadows in viewport
+                          ("use_shadow_jitter_viewport", True),   # soft shadows in viewport
+                          ("shadow_pool_size", "256")):           # 512 MB default; iGPUs share RAM
             if hasattr(ee, attr):
                 try:
                     setattr(ee, attr, val)
                 except (TypeError, AttributeError):
                     pass
+        rto = getattr(ee, "ray_tracing_options", None)
+        if rto is not None and hasattr(rto, "resolution_scale"):
+            try:
+                rto.resolution_scale = "2"   # half-res tracing: ~1/4 the buffers
+            except TypeError:
+                pass
         # Grazing light is what makes clay read; a dim world keeps it from
         # washing out.
         space = context.space_data
@@ -1018,6 +1118,46 @@ class PCLAY_OT_studio_setup(Operator):
         return {"FINISHED"}
 
 
+class PCLAY_OT_fp_load(Operator):
+    bl_idname = "pclay.fp_load"
+    bl_label = "Load Fingerprint Texture"
+    bl_description = ("Use your own grayscale fingerprint/smudge texture (ideally seamless). "
+                      "Applies to every clay material in the file")
+    bl_options = {"REGISTER", "UNDO"}
+
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH")
+    filter_image: BoolProperty(default=True, options={"HIDDEN"})
+    filter_folder: BoolProperty(default=True, options={"HIDDEN"})
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        group = _get_group(SHADER_GROUP, SHADER_VERSION, _build_shader_group)
+        node = group.nodes.get(FP_NODE)
+        try:
+            img = bpy.data.images.load(self.filepath, check_existing=True)
+        except RuntimeError as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+        img.colorspace_settings.name = "Non-Color"
+        node.image = img
+        return {"FINISHED"}
+
+
+class PCLAY_OT_fp_reset(Operator):
+    bl_idname = "pclay.fp_reset"
+    bl_label = "Built-in Fingerprints"
+    bl_description = "Go back to the built-in generated fingerprint texture"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        group = _get_group(SHADER_GROUP, SHADER_VERSION, _build_shader_group)
+        group.nodes.get(FP_NODE).image = get_fingerprint_image()
+        return {"FINISHED"}
+
+
 class PCLAY_OT_sync_viewport_color(Operator):
     bl_idname = "pclay.sync_viewport_color"
     bl_label = "Sync Solid View Color"
@@ -1126,6 +1266,11 @@ class VIEW3D_PT_procedural_clay_detail(Panel):
                 if name in node.inputs:  # older materials may lack newer inputs
                     col.prop(node.inputs[name], "default_value", text=name)
             col.prop(node.inputs["Seed"], "default_value", text="Seed")
+            fpn = node.node_tree.nodes.get(FP_NODE)
+            if fpn is not None:
+                row = layout.row(align=True)
+                row.operator(PCLAY_OT_fp_load.bl_idname, text="Custom Prints", icon="IMAGE_DATA")
+                row.operator(PCLAY_OT_fp_reset.bl_idname, text="", icon="LOOP_BACK")
             layout.operator(PCLAY_OT_sync_viewport_color.bl_idname, icon="SHADING_SOLID")
 
         layout.operator(PCLAY_OT_randomize_seed.bl_idname, text="Randomize Seeds",
@@ -1143,6 +1288,8 @@ classes = (
     PCLAY_OT_randomize_seed,
     PCLAY_OT_eevee_setup,
     PCLAY_OT_preset,
+    PCLAY_OT_fp_load,
+    PCLAY_OT_fp_reset,
     PCLAY_OT_studio_setup,
     PCLAY_OT_sync_viewport_color,
     VIEW3D_PT_procedural_clay,

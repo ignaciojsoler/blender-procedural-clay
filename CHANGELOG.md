@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.5.0
+- **Fingerprints rebuilt as a texture**: a tileable 2048 map of overlapping finger smudges with real-looking loops/whorls, generated once with numpy (~10 s), cached on disk and packed into the .blend. Box-projected in object space (no UVs). Textures are mipmapped, so ridges never shimmer in EEVEE and cost one lookup. Shows mostly in the highlights (touched clay is slightly polished).
+- **Custom Prints**: load your own seamless fingerprint texture (Detail panel), or go back to the built-in one.
+- **Deform: adaptive subdivision**. Measures the mesh's mean edge length and only adds the levels it needs (none on meshes already subdivided). Before, a fixed 2 levels on top of a Subdivision Surface multiplied faces by 16 and blew up memory.
+- **Deform: smoothed normals**. Displacement follows normals blurred over roughly a lump's width, so concave creases (inset + extrude, sockets, mouths) no longer tear.
+- EEVEE setup uses a 256 MB shadow pool and half-resolution ray tracing (lighter on integrated GPUs that share system RAM).
+
 ## 2.4.0
 - **Fingerprints**: scattered finger presses with whorl-like ridges (Voronoi-placed, random rotation/size, elliptical, broken up by noise). Two bumps: a soft press sized to the print and ridges sized to their wavelength.
 - Ridges fade with camera distance before they get smaller than ~2-3 px, so they never shimmer in EEVEE; the soft press stays.

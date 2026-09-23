@@ -9,7 +9,7 @@ Blender add-on that turns any object into handmade plasticine: a procedural clay
 ## Features
 
 - **UV-free material**: Object-coordinate Noise + Voronoi drive three chained bumps (soft lumps, pores, fine grain), color tint and roughness breakup.
-- **Fingerprints**: finger presses with ridges, fading with distance so they don't flicker.
+- **Fingerprints**: generated, tileable smudge map with real ridge patterns, box-projected (no UVs), mipmapped so it doesn't flicker. You can load your own.
 - **Cavity**: dents, pores and grain also darken the albedo, so the detail stays visible under EEVEE's flat lighting.
 - **Clay Deform modifier** (Geometry Nodes): makes the silhouette lumpy, not just the shading. Lumps are relative to the object's size and biased inward, so the overall shape is preserved.
 - **Sidebar panel** (`N` > Clay): Clay Color, Roughness, Grain Intensity, Imperfection, Deformation, plus a Detail subpanel with scales, pores, seed, etc.
@@ -47,8 +47,8 @@ Tips:
 | Lumps | Noise 3D, low frequency | Bump (Imperfection), color tint, cavity |
 | Pores | Voronoi 3D F1, ~half the cells | Bump (Grain Intensity), cavity, roughness |
 | Grain | Noise 3D, high frequency | Bump (Grain Intensity), roughness |
-| Fingerprints | Voronoi 3D spots, rotated elliptical rings + angle + noise | Press bump, ridge bump (distance-faded), cavity |
-| Shape | Noise 3D on vertex positions (Geometry Nodes) | Vertex offset along normal |
+| Fingerprints | Generated 2048 tileable image, box projection | Bump, lower roughness, slight cavity |
+| Shape | Noise 3D on vertex positions (Geometry Nodes), adaptive subdivision | Offset along blurred normals |
 
 Bump distances scale with 1 / frequency, so changing a scale changes feature size without changing how strong it looks.
 
