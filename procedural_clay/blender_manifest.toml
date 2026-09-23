@@ -1,0 +1,21 @@
+schema_version = "1.0.0"
+
+id = "procedural_clay"
+version = "2.8.0"
+name = "Procedural Clay"
+tagline = "UV-free procedural plasticine with fingerprints and stop motion"
+maintainer = "Ignacio Soler <ignaciojsoler@gmail.com>"
+type = "add-on"
+
+website = "https://github.com/ignaciojsoler/blender-procedural-clay"
+
+tags = ["Material", "Geometry Nodes", "Render"]
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+[permissions]
+files = "Cache the generated fingerprint texture on disk"

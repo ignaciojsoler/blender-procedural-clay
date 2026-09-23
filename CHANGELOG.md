@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.8.0
+- **Draft / Final** quality switch in the panel. Draft (default) keeps the viewport responsive on modest GPUs: no ray tracing, no viewport shadow jitter, 8 viewport samples, subdivision capped at 1 via Simplify. Final turns them back on. Only scene settings change; materials, modifiers and objects are untouched. Simplify is only turned off again if the add-on turned it on.
+- **Render-farm safe stop motion**: the shader's boil drivers read plain scene custom properties saved in the .blend, so files render correctly on machines without the add-on.
+- **Blender extension** packaging (`procedural_clay/blender_manifest.toml`), installable as a .zip in Blender 4.2+. The fingerprint cache goes to the extension's user folder when installed as an extension.
+- **Studio Setup** lights are ~45% softer and use the AgX Punchy look: with AgX, strongly lit colors drift towards white, so clay now keeps rich, saturated colors.
+- `scripts/showcase.py` renders the README images (presets, fingerprints, stop-motion boil) with `blender -b`.
+- GPL-3.0-or-later license.
+
 ## 2.7.1
 - **Fingerprints rebuilt around how clay actually takes a print**: each press is a shallow dent with crisp ridges, and the displaced clay forms a raised rim. Presses are composited "over" (a new press reshapes the clay under it), so the newest print stays crisp and cuts older ones.
 - The map has two channels: dents + rims (G), which read at any distance, and the ridge detail (R - G) for close-ups. Two bumps, each sized to its own feature scale.

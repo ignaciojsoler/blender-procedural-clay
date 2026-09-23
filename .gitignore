@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 *.blend1
 .DS_Store
+dist/
+*.zip

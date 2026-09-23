@@ -1,7 +1,10 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Ignacio Soler
+
 bl_info = {
     "name": "Procedural Clay",
     "author": "Ignacio Soler",
-    "version": (2, 7, 1),
+    "version": (2, 8, 0),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar (N) > Clay",
     "description": "UV-free procedural plasticine: material + silhouette deformation, tuned for EEVEE",
@@ -277,7 +280,15 @@ def generate_fingerprint_map(size=FP_RES, count=600, seed=11):
 
 
 def _fp_cache_path():
-    folder = bpy.utils.user_resource("DATAFILES", path="procedural_clay", create=True)
+    folder = None
+    pkg = __package__ or ""
+    if pkg.startswith("bl_ext.") and hasattr(bpy.utils, "extension_path_user"):
+        try:
+            folder = bpy.utils.extension_path_user(pkg, create=True)  # extension install
+        except (ValueError, RuntimeError):
+            folder = None
+    if folder is None:
+        folder = bpy.utils.user_resource("DATAFILES", path="procedural_clay", create=True)
     return os.path.join(folder, FP_CACHE)
 
 
@@ -903,7 +914,8 @@ def _on_stop_change(self, context):
             mod.node_group = group
         enable_rest_position(obj)
         push_deform_settings(obj)
-    # material drivers read these props directly; just make sure they re-evaluate
+    sync_stop_props(context.scene)
+    # material drivers read the mirrored props; make sure they re-evaluate
     for mat in bpy.data.materials:
         if find_clay_node(mat) is not None:
             mat.node_tree.update_tag()
@@ -922,10 +934,25 @@ class PCLAY_StopMotion(PropertyGroup):
                         description="How much the surface changes between held poses")
 
 
+def sync_stop_props(scene):
+    """Mirror the stop-motion settings into plain scene custom properties.
+    Drivers read these instead of the add-on's registered properties, so a
+    .blend rendered on a machine without the add-on (render farm, a friend's
+    PC) still boils: custom properties are saved in the file, RNA properties
+    of an unregistered add-on are not readable."""
+    sm = getattr(scene, "pclay_stop", None)
+    if sm is None:
+        return
+    scene["pclay_stop_on"] = 1.0 if sm.enabled else 0.0
+    scene["pclay_stop_step"] = float(sm.step)
+    scene["pclay_stop_boil"] = float(sm.boil)
+
+
 def ensure_boil_drivers(mat, scene):
     """Drive the shader's Boil Frame/Amount from the scene's stop-motion props.
     Simple expressions only (floor/max/frame), so they run without Python
     auto-execution being enabled."""
+    sync_stop_props(scene)
     node = find_clay_node(mat)
     if node is None or "Boil Frame" not in node.inputs:
         return
@@ -942,8 +969,8 @@ def ensure_boil_drivers(mat, scene):
         fc = nt.driver_add(path)
         drv = fc.driver
         drv.type = "SCRIPTED"
-        for var_name, prop in (("step", "pclay_stop.step"), ("on", "pclay_stop.enabled"),
-                               ("boil", "pclay_stop.boil")):
+        for var_name, prop in (("step", '["pclay_stop_step"]'), ("on", '["pclay_stop_on"]'),
+                               ("boil", '["pclay_stop_boil"]')):
             v = drv.variables.new()
             v.name = var_name
             v.type = "SINGLE_PROP"
@@ -1156,6 +1183,54 @@ class PCLAY_OT_randomize_seed(Operator):
         return {"FINISHED"}
 
 
+# --------------------------------------------------------------------------
+# Draft / Final
+# --------------------------------------------------------------------------
+# Draft keeps the viewport responsive on modest GPUs; Final turns on the
+# expensive parts. Only scene/render settings change - materials, modifiers
+# and objects are never touched, so switching back and forth is safe.
+
+QUALITY = {
+    #          raytracing, viewport jitter, viewport samples, simplify subdiv (None = off)
+    "DRAFT": (False, False, 8, 1),
+    "FINAL": (True, True, 16, None),
+}
+
+
+def _set(obj, attr, val):
+    if obj is not None and hasattr(obj, attr):
+        try:
+            setattr(obj, attr, val)
+        except (TypeError, AttributeError, ValueError):
+            pass
+
+
+def apply_quality(scene, mode):
+    rt, jitter, vp_samples, simplify = QUALITY[mode]
+    ee = scene.eevee
+    _set(ee, "use_raytracing", rt)
+    _set(ee, "use_shadow_jitter_viewport", jitter)
+    _set(ee, "taa_samples", vp_samples)
+    r = scene.render
+    if simplify is not None:
+        if not r.use_simplify:
+            scene["pclay_owns_simplify"] = True   # we turned it on, we may turn it off
+        r.use_simplify = True
+        r.simplify_subdivision = simplify
+    elif scene.get("pclay_owns_simplify"):
+        r.use_simplify = False
+        del scene["pclay_owns_simplify"]
+    coll = bpy.data.collections.get("Clay Studio")
+    if coll is not None:
+        for ob in coll.objects:
+            if ob.type == "LIGHT":
+                _set(ob.data, "use_shadow_jitter", jitter)
+
+
+def _on_quality_change(self, context):
+    apply_quality(context.scene, context.scene.pclay_quality)
+
+
 class PCLAY_OT_eevee_setup(Operator):
     bl_idname = "pclay.eevee_setup"
     bl_label = "EEVEE Clay Setup"
@@ -1189,12 +1264,14 @@ class PCLAY_OT_eevee_setup(Operator):
                 rto.resolution_scale = "2"   # half-res tracing: ~1/4 the buffers
             except TypeError:
                 pass
+        # the expensive toggles above follow Draft / Final
+        apply_quality(scene, scene.pclay_quality)
         # Grazing light is what makes clay read; a dim world keeps it from
         # washing out.
         space = context.space_data
         if space and space.type == "VIEW_3D" and space.shading.type in {"SOLID", "WIREFRAME"}:
             space.shading.type = "MATERIAL"
-        self.report({"INFO"}, "EEVEE configured for clay")
+        self.report({"INFO"}, f"EEVEE configured for clay ({scene.pclay_quality.title()})")
         return {"FINISHED"}
 
 
@@ -1342,7 +1419,7 @@ class PCLAY_OT_studio_setup(Operator):
             dist = offset.length
             ld.energy = power * dist * dist * self.light_power
             if hasattr(ld, "use_shadow_jitter"):
-                ld.use_shadow_jitter = True  # soft shadows in the EEVEE viewport too
+                ld.use_shadow_jitter = context.scene.pclay_quality == "FINAL"
             ob = bpy.data.objects.new(name, ld)
             ob.location = center + offset
             ob.rotation_euler = (center - ob.location).to_track_quat("-Z", "Y").to_euler()
@@ -1350,9 +1427,9 @@ class PCLAY_OT_studio_setup(Operator):
             return ob
 
         s = size
-        add_light("Clay Key", Vector((-1.4 * s, -1.6 * s, 1.8 * s)), 50.0, 2.5 * s)
-        add_light("Clay Fill", Vector((1.8 * s, -1.2 * s, 0.8 * s)), 12.0, 3.5 * s)
-        add_light("Clay Rim", Vector((0.6 * s, 1.6 * s, 1.6 * s)), 35.0, 1.5 * s)
+        add_light("Clay Key", Vector((-1.4 * s, -1.6 * s, 1.8 * s)), 27.5, 2.5 * s)
+        add_light("Clay Fill", Vector((1.8 * s, -1.2 * s, 0.8 * s)), 6.6, 3.5 * s)
+        add_light("Clay Rim", Vector((0.6 * s, 1.6 * s, 1.6 * s)), 19.0, 1.5 * s)
 
         cam = scene.camera
         if cam is None:
@@ -1376,7 +1453,9 @@ class PCLAY_OT_studio_setup(Operator):
 
         try:
             scene.view_settings.view_transform = "AgX"
-            scene.view_settings.look = "AgX - Medium High Contrast"
+            # Punchy keeps clay colors rich. Lights are kept moderate for the
+            # same reason: with AgX, strongly lit colors drift towards white.
+            scene.view_settings.look = "AgX - Punchy"
         except TypeError:
             pass
         bpy.ops.pclay.eevee_setup()
@@ -1463,6 +1542,8 @@ class VIEW3D_PT_procedural_clay(Panel):
         row = layout.row(align=True)
         row.operator(PCLAY_OT_studio_setup.bl_idname, icon="LIGHT_AREA")
         row.operator(PCLAY_OT_eevee_setup.bl_idname, text="EEVEE Only", icon="SHADING_RENDERED")
+        row = layout.row(align=True)
+        row.prop(context.scene, "pclay_quality", expand=True)
 
         obj = context.active_object
         mat, node = _active_clay(context)
@@ -1594,11 +1675,19 @@ def register():
         bpy.utils.register_class(cls)
     bpy.types.Object.pclay_deform = PointerProperty(type=PCLAY_DeformSettings)
     bpy.types.Scene.pclay_stop = PointerProperty(type=PCLAY_StopMotion)
+    bpy.types.Scene.pclay_quality = bpy.props.EnumProperty(
+        name="Quality",
+        items=[("DRAFT", "Draft", "Responsive viewport: no ray tracing, no viewport shadow "
+                                  "jitter, 8 samples, subdivision capped at 1 (Simplify)"),
+               ("FINAL", "Final", "Full quality: ray tracing, soft viewport shadows, "
+                                  "16 viewport samples, full subdivision")],
+        default="DRAFT", update=_on_quality_change)
 
 
 def unregister():
     del bpy.types.Object.pclay_deform
     del bpy.types.Scene.pclay_stop
+    del bpy.types.Scene.pclay_quality
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
 
