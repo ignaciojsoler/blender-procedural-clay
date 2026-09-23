@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.7.1
+- **Fingerprints rebuilt around how clay actually takes a print**: each press is a shallow dent with crisp ridges, and the displaced clay forms a raised rim. Presses are composited "over" (a new press reshapes the clay under it), so the newest print stays crisp and cuts older ones.
+- The map has two channels: dents + rims (G), which read at any distance, and the ridge detail (R - G) for close-ups. Two bumps, each sized to its own feature scale.
+- Touched areas are slightly glossier. Existing files regenerate the texture automatically (one-time, ~10 s).
+
 ## 2.6.1
 - Boil was far too subtle (~0.1% of object size between poses). It is now its own displacement layer with a fresh noise lookup per pose: ~0.5% mean / 2% peak at Boil 0.5, and it works even with Deformation at 0. Shader boil offset 5x stronger.
 - Toggling Stop Motion upgrades every clay material and Clay Deform modifier in the file, so it works without re-running Apply Clay.
